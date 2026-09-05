@@ -19,6 +19,13 @@ const (
 	defaultLogLevel         = slog.LevelInfo
 )
 
+// Valid TCP port range. Port 0 is excluded: it would make the server pick an
+// arbitrary free port, which cannot match the published compose port.
+const (
+	minPort = 1
+	maxPort = 65535
+)
+
 // Config holds the service parameters. Variable names are listed in
 // .env.example, which is the source of truth for them.
 type Config struct {
@@ -37,6 +44,9 @@ func Load() (Config, error) {
 
 	if cfg.HTTPPort, err = intFromEnv("HTTP_PORT", defaultHTTPPort); err != nil {
 		return Config{}, err
+	}
+	if cfg.HTTPPort < minPort || cfg.HTTPPort > maxPort {
+		return Config{}, fmt.Errorf("HTTP_PORT: %d is out of range %d-%d", cfg.HTTPPort, minPort, maxPort)
 	}
 	if cfg.HTTPReadTimeout, err = durationFromEnv("HTTP_READ_TIMEOUT", defaultHTTPReadTimeout); err != nil {
 		return Config{}, err

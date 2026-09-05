@@ -29,7 +29,7 @@ go.work.sum
 
 # Editor/IDE
 .idea/
-# .vscode/
+.vscode/
 
 # Working documents: assignment, design notes, plan, decision log and
 # assistant instructions. Not part of the service; only code, README and
