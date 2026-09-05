@@ -88,6 +88,11 @@ func durationFromEnv(key string, def time.Duration) (time.Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}
+	// Go reads a non-positive timeout as "no timeout at all", so an attempt to
+	// tighten the setting would silently disable it instead.
+	if v <= 0 {
+		return 0, fmt.Errorf("%s: %s is not a positive duration", key, raw)
+	}
 
 	return v, nil
 }
