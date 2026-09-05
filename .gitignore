@@ -28,5 +28,12 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
+.idea/
 # .vscode/
+
+# Working documents: assignment, design notes, plan, decision log and
+# assistant instructions. Not part of the service; only code, README and
+# openapi.yaml go into the repository.
+CLAUDE.md
+PLAN.md
+.local/

@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.local
+.env
+CLAUDE.md
+PLAN.md
+README.md
+Dockerfile
+docker-compose.yml
