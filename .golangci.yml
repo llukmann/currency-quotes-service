@@ -1,0 +1,40 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    # provider response bodies must be closed
+    - bodyclose
+    # catches context.Background() where the incoming context belongs
+    - contextcheck
+    # errors compared via errors.Is/As instead of == and type assertions
+    - errorlint
+    # returning nil while the error is non-nil
+    - nilerr
+    # HTTP and database calls made without a context
+    - noctx
+    - gocritic
+    - misspell
+  settings:
+    errcheck:
+      check-type-assertions: true
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/llukmann/currency-quotes-service

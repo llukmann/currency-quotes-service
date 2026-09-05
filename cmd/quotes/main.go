@@ -1,0 +1,87 @@
+// Command quotes is the entry point of the currency quotes service.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/llukmann/currency-quotes-service/internal/api"
+	"github.com/llukmann/currency-quotes-service/internal/config"
+)
+
+func main() {
+	if err := run(); err != nil {
+		slog.Error("service stopped with error", slog.Any("error", err))
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	slog.SetDefault(logger)
+
+	// Cancelled on SIGINT/SIGTERM. The errgroup derives its own context from
+	// this one, which is also cancelled by the first error of any goroutine in
+	// the group. The workers will join the same group in step 4.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	srv := &http.Server{
+		Addr:         net.JoinHostPort("", strconv.Itoa(cfg.HTTPPort)),
+		Handler:      api.NewRouter(),
+		ReadTimeout:  cfg.HTTPReadTimeout,
+		WriteTimeout: cfg.HTTPWriteTimeout,
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		logger.Info("http server started", slog.String("addr", srv.Addr))
+
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+
+		return nil
+	})
+
+	g.Go(func() error {
+		<-ctx.Done()
+		logger.Info("shutdown started", slog.String("timeout", cfg.ShutdownTimeout.String()))
+
+		// The shutdown context must not inherit the cancellation that already
+		// fired, otherwise Shutdown would abort in-flight requests instead of
+		// letting them finish.
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
+		defer cancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("http shutdown: %w", err)
+		}
+
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	logger.Info("service stopped")
+
+	return nil
+}
