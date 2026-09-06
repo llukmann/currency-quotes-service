@@ -17,6 +17,7 @@ import (
 
 	"github.com/llukmann/currency-quotes-service/internal/api"
 	"github.com/llukmann/currency-quotes-service/internal/config"
+	"github.com/llukmann/currency-quotes-service/internal/storage/postgres"
 )
 
 func main() {
@@ -40,6 +41,12 @@ func run() error {
 	// the group. The workers will join the same group in step 4.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Before the server accepts anything: a schema older than the binary would
+	// only surface later, as failing queries.
+	if err := postgres.Migrate(ctx, cfg.DatabaseURL, logger); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
 
 	srv := &http.Server{
 		Addr:         net.JoinHostPort("", strconv.Itoa(cfg.HTTPPort)),
