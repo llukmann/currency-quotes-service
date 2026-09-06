@@ -29,6 +29,7 @@ const (
 // Config holds the service parameters. Variable names are listed in
 // .env.example, which is the source of truth for them.
 type Config struct {
+	DatabaseURL      string
 	HTTPPort         int
 	HTTPReadTimeout  time.Duration
 	HTTPWriteTimeout time.Duration
@@ -42,6 +43,9 @@ func Load() (Config, error) {
 	var cfg Config
 	var err error
 
+	if cfg.DatabaseURL, err = requiredFromEnv("DATABASE_URL"); err != nil {
+		return Config{}, err
+	}
 	if cfg.HTTPPort, err = intFromEnv("HTTP_PORT", defaultHTTPPort); err != nil {
 		return Config{}, err
 	}
@@ -62,6 +66,17 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// requiredFromEnv reads a variable that has no meaningful default. Connecting
+// to some arbitrary fallback database is worse than refusing to start.
+func requiredFromEnv(key string) (string, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return "", fmt.Errorf("%s is required", key)
+	}
+
+	return raw, nil
 }
 
 func intFromEnv(key string, def int) (int, error) {
