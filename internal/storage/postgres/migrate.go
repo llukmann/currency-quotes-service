@@ -69,6 +69,19 @@ func Migrate(ctx context.Context, databaseURL string, logger *slog.Logger) error
 	// deferred call above already owns, and the embedded source holds nothing to
 	// release.
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		// Up refuses to run against a schema left dirty by an earlier failed
+		// attempt, and its own message ("Fix and force version.") assumes the
+		// reader already knows the tool. Every start would repeat it, so say
+		// what happened and what to do about it instead.
+		var dirty migrate.ErrDirty
+		if errors.As(err, &dirty) {
+			return fmt.Errorf(
+				"schema is marked dirty at version %d: an earlier migration failed part way "+
+					"and the schema is in an unknown state; reset the database with "+
+					"'docker compose down -v', or inspect it and force the version once it matches: %w",
+				dirty.Version, err)
+		}
+
 		return fmt.Errorf("apply migrations: %w", err)
 	}
 
