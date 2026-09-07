@@ -12,6 +12,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	migratepgx "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+
 	// Registers the "pgx" driver used by sql.Open below.
 	_ "github.com/jackc/pgx/v5/stdlib"
 
