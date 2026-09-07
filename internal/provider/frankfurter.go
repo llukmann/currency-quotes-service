@@ -160,13 +160,19 @@ func parseRate(body []byte, quote string) (Rate, error) {
 	return Rate{Value: value, Date: date}, nil
 }
 
-// statusError classifies a response that is not 200. Too many requests and the
-// server's own failures are the upstream being momentarily unable to answer;
-// everything else is a request it will reject just as firmly next time -- a
-// currency it does not know is answered with 404 -- so retrying would only
-// delay the failure by the whole backoff.
+// statusError classifies a response that is not 200.
+//
+// Three answers are the upstream being momentarily unable to serve rather than
+// unwilling: 408, where it gave up waiting on a request that took too long,
+// which is the same accident as a timeout on our side and no more likely to
+// repeat; 429, where it asks to be left alone for a while; and anything from
+// 500 up, where it is failing outright. Every other rejection would be repeated
+// word for word -- a currency it does not know is answered with 404 -- so
+// retrying would buy nothing but the backoff.
 func statusError(pair domain.Pair, status int, body []byte) error {
-	if status == http.StatusTooManyRequests || status >= http.StatusInternalServerError {
+	if status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests ||
+		status >= http.StatusInternalServerError {
 		return fmt.Errorf("fetch rate %s: %w: upstream status %d: %s", pair, ErrTransient, status, snippet(body))
 	}
 

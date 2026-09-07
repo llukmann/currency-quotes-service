@@ -116,6 +116,14 @@ func TestClientFetchRate(t *testing.T) {
 			body:   `{"message":"bad request"}`,
 		},
 		{
+			// The upstream giving up on a slow request, which the next attempt
+			// may well not meet.
+			name:          "upstream timed out waiting for the request",
+			status:        http.StatusRequestTimeout,
+			body:          `{"message":"request timeout"}`,
+			wantTransient: true,
+		},
+		{
 			name:          "rate limited",
 			status:        http.StatusTooManyRequests,
 			body:          `{"message":"too many requests"}`,

@@ -128,6 +128,24 @@ func TestRetrierFetchRate(t *testing.T) {
 	}
 }
 
+// TestJitteredStaysInItsWindow pins the formula rather than the draw. The
+// window is what the spread is for: a factor that could come out at or below
+// zero would collapse the backoff, and one drawn from [0,1) would only ever
+// shorten it, which is the mistake this guards against.
+func TestJitteredStaysInItsWindow(t *testing.T) {
+	const nominal = time.Second
+
+	low := time.Duration(float64(nominal) * jitterMin)
+	high := time.Duration(float64(nominal) * (jitterMin + jitterSpan))
+
+	for range 1000 {
+		got := jittered(nominal)
+
+		require.GreaterOrEqual(t, got, low)
+		require.Less(t, got, high)
+	}
+}
+
 // TestRetrierBackoffIsInterruptible checks that the pause between attempts ends
 // with the context rather than with the timer. The backoff is an hour: if the
 // wait were not interruptible this test would not fail, it would hang.

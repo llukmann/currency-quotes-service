@@ -4,9 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/llukmann/currency-quotes-service/internal/domain"
+)
+
+// Each pause is multiplied by a factor drawn uniformly from
+// [jitterMin, jitterMin+jitterSpan). Doubling alone spaces out the attempts of
+// one caller but not those of several: a pool of workers that met the same 429
+// would step back and return in unison, rebuilding the burst that produced the
+// limit. The spread is what breaks the group apart, which is why it belongs
+// here rather than in a later round of tuning.
+const (
+	jitterMin  = 0.5
+	jitterSpan = 1.0
 )
 
 // Retrier repeats a fetch that failed in a way the next attempt may not meet.
@@ -24,7 +36,8 @@ var _ RateProvider = (*Retrier)(nil)
 //
 // attempts is the total number of tries, not the number of retries after the
 // first, so one means no retrying at all. backoff is the pause before the
-// second attempt and doubles before each one after it.
+// second attempt and doubles before each one after it; every pause is drawn
+// from a window around its nominal length, see jittered.
 //
 // The three settings arrive as arguments rather than being read from the
 // environment here: the caller that constructs a provider is the one holding
@@ -54,10 +67,12 @@ func (r *Retrier) FetchRate(ctx context.Context, pair domain.Pair) (Rate, error)
 
 	for attempt := 1; attempt <= r.attempts; attempt++ {
 		if attempt > 1 {
-			if err := sleep(ctx, delay); err != nil {
+			if err := sleep(ctx, jittered(delay)); err != nil {
 				return Rate{}, fmt.Errorf("fetch rate %s: %w", pair, err)
 			}
 
+			// The undistorted delay is what doubles, so the schedule keeps its
+			// shape instead of drifting with whatever each draw happened to be.
 			delay *= 2
 		}
 
@@ -76,6 +91,15 @@ func (r *Retrier) FetchRate(ctx context.Context, pair domain.Pair) (Rate, error)
 	}
 
 	return Rate{}, fmt.Errorf("after %d attempts: %w", r.attempts, lastErr)
+}
+
+// jittered spreads d over a window around itself.
+//
+// The generator of math/rand/v2 is safe for concurrent use and needs no
+// seeding, and both matter here: one Retrier is shared by the whole pool, and
+// those workers are exactly the callers that must not draw the same pause.
+func jittered(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * (jitterMin + rand.Float64()*jitterSpan))
 }
 
 // sleep waits for d or for ctx to be done, whichever comes first.
