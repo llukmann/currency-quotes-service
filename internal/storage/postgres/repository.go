@@ -30,10 +30,10 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-// EnqueueTask adds a refresh of pair to the queue and returns the task as
+// CreateTask adds a refresh of pair to the queue and returns the task as
 // stored. The identifier and the timestamps come from the database, so what is
 // returned is the row a client will later be shown.
-func (r *Repository) EnqueueTask(ctx context.Context, pair domain.Pair) (domain.UpdateTask, error) {
+func (r *Repository) CreateTask(ctx context.Context, pair domain.Pair) (domain.UpdateTask, error) {
 	const query = `
 		INSERT INTO quote_updates (pair)
 		VALUES ($1)
@@ -41,7 +41,7 @@ func (r *Repository) EnqueueTask(ctx context.Context, pair domain.Pair) (domain.
 
 	t, err := scanTask(r.pool.QueryRow(ctx, query, pair))
 	if err != nil {
-		return domain.UpdateTask{}, fmt.Errorf("enqueue task: %w", err)
+		return domain.UpdateTask{}, fmt.Errorf("create task: %w", err)
 	}
 
 	return t, nil
