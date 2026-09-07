@@ -14,12 +14,12 @@ import (
 	"github.com/llukmann/currency-quotes-service/internal/domain"
 )
 
-// Repository is the whole of the service's persistence: the update queue and
-// the quotes it produces. The two tables sit behind one type because the quotes
-// table is written only by the finalisation of an update, and because every
-// statement that moves a task between statuses then lives in one file and can
-// be read as a set -- each of them has to carry updated_at = now(), and nothing
-// in the schema enforces that.
+// Repository is the whole of the service's persistence: the queue of update
+// tasks and the quotes they produce. The two tables sit behind one type
+// because the quotes table is written only by the finalisation of a task, and
+// because every statement that moves a task between statuses then lives in one
+// file and can be read as a set -- each of them has to carry
+// updated_at = now(), and nothing in the schema enforces that.
 type Repository struct {
 	pool *pgxpool.Pool
 }
@@ -30,31 +30,32 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-// CreateUpdate enqueues a refresh of pair and returns the task as stored. The
-// identifier and the timestamps come from the database, so what is returned is
-// the row a client will later be shown.
-func (r *Repository) CreateUpdate(ctx context.Context, pair domain.Pair) (domain.QuoteUpdate, error) {
+// EnqueueTask adds a refresh of pair to the queue and returns the task as
+// stored. The identifier and the timestamps come from the database, so what is
+// returned is the row a client will later be shown.
+func (r *Repository) EnqueueTask(ctx context.Context, pair domain.Pair) (domain.UpdateTask, error) {
 	const query = `
 		INSERT INTO quote_updates (pair)
 		VALUES ($1)
 		RETURNING id, pair, status, attempts, COALESCE(error, ''), created_at, updated_at`
 
-	u, err := scanUpdate(r.pool.QueryRow(ctx, query, pair))
+	t, err := scanTask(r.pool.QueryRow(ctx, query, pair))
 	if err != nil {
-		return domain.QuoteUpdate{}, fmt.Errorf("create update: %w", err)
+		return domain.UpdateTask{}, fmt.Errorf("enqueue task: %w", err)
 	}
 
-	return u, nil
+	return t, nil
 }
 
-// GetUpdateByID returns the task and, once it has completed successfully, the
-// rate it produced. The join keeps that to a single round trip: the endpoint
-// serving this needs both halves at once, and a quote row exists for precisely
-// the tasks in StatusDone, since the finalisation writes both in one
-// transaction.
+// GetTask returns the task and, once it has completed successfully, the rate it
+// produced. It backs GET /quotes/updates/{id}, the endpoint a client polls, and
+// that is its only caller: a worker carries its task in hand and never reads it
+// back. The join keeps the answer to a single round trip, and a quote row
+// exists for precisely the tasks in StatusDone, since the finalisation writes
+// both in one transaction.
 //
 // Returns domain.ErrNotFound if no such task exists.
-func (r *Repository) GetUpdateByID(ctx context.Context, id uuid.UUID) (domain.UpdateDetails, error) {
+func (r *Repository) GetTask(ctx context.Context, id uuid.UUID) (domain.TaskDetails, error) {
 	const query = `
 		SELECT u.id, u.pair, u.status, u.attempts, COALESCE(u.error, ''), u.created_at, u.updated_at,
 		       q.update_id, q.pair, q.rate::text, q.rate_date, q.fetched_at
@@ -63,7 +64,7 @@ func (r *Repository) GetUpdateByID(ctx context.Context, id uuid.UUID) (domain.Up
 		 WHERE u.id = $1`
 
 	var (
-		d domain.UpdateDetails
+		d domain.TaskDetails
 		// Null for every task that has not completed, hence the pointers.
 		quoteID   *uuid.UUID
 		quotePair *domain.Pair
@@ -73,15 +74,15 @@ func (r *Repository) GetUpdateByID(ctx context.Context, id uuid.UUID) (domain.Up
 	)
 
 	err := r.pool.QueryRow(ctx, query, id).Scan(
-		&d.Update.ID, &d.Update.Pair, &d.Update.Status, &d.Update.Attempts,
-		&d.Update.Error, &d.Update.CreatedAt, &d.Update.UpdatedAt,
+		&d.Task.ID, &d.Task.Pair, &d.Task.Status, &d.Task.Attempts,
+		&d.Task.Error, &d.Task.CreatedAt, &d.Task.UpdatedAt,
 		&quoteID, &quotePair, &rawRate, &rateDate, &fetchedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.UpdateDetails{}, fmt.Errorf("get update %s: %w", id, domain.ErrNotFound)
+		return domain.TaskDetails{}, fmt.Errorf("get task %s: %w", id, domain.ErrNotFound)
 	}
 	if err != nil {
-		return domain.UpdateDetails{}, fmt.Errorf("get update %s: %w", id, err)
+		return domain.TaskDetails{}, fmt.Errorf("get task %s: %w", id, err)
 	}
 
 	if quoteID == nil {
@@ -90,7 +91,7 @@ func (r *Repository) GetUpdateByID(ctx context.Context, id uuid.UUID) (domain.Up
 
 	rate, err := decimal.NewFromString(*rawRate)
 	if err != nil {
-		return domain.UpdateDetails{}, fmt.Errorf("get update %s: parse rate %q: %w", id, *rawRate, err)
+		return domain.TaskDetails{}, fmt.Errorf("get task %s: parse rate %q: %w", id, *rawRate, err)
 	}
 
 	d.Quote = &domain.Quote{
@@ -105,7 +106,7 @@ func (r *Repository) GetUpdateByID(ctx context.Context, id uuid.UUID) (domain.Up
 }
 
 // GetLatestQuote returns the most recently fetched rate for pair, whichever
-// update produced it.
+// task produced it.
 //
 // Returns domain.ErrNotFound if the pair has never been quoted.
 func (r *Repository) GetLatestQuote(ctx context.Context, pair domain.Pair) (domain.Quote, error) {
@@ -139,9 +140,9 @@ func (r *Repository) GetLatestQuote(ctx context.Context, pair domain.Pair) (doma
 	return q, nil
 }
 
-// ClaimPending takes the oldest waiting task, marks it in progress and returns
-// it. The second result is false when there is nothing to do, which is the
-// normal state of an idle worker rather than an error.
+// ClaimTask takes the oldest waiting task, marks it in progress and returns it.
+// The second result is false when there is nothing to do, which is the normal
+// state of an idle worker rather than an error.
 //
 // Selecting and marking are one statement on purpose: read the row first and
 // mark it second, and another worker reads it in between, so the provider is
@@ -151,9 +152,9 @@ func (r *Repository) GetLatestQuote(ctx context.Context, pair domain.Pair) (doma
 //
 // The row lock lasts only until this statement's transaction commits, so from
 // then on the only thing saying the task is taken is its status. That is why
-// the recovery pass has to exist, and why Complete and Fail have to prove the
-// claim they hold is still current.
-func (r *Repository) ClaimPending(ctx context.Context) (domain.QuoteUpdate, bool, error) {
+// the recovery pass has to exist, and why CompleteTask and FailTask have to
+// prove the claim they hold is still current.
+func (r *Repository) ClaimTask(ctx context.Context) (domain.UpdateTask, bool, error) {
 	// attempts is incremented here rather than on failure: it counts how many
 	// times processing was started, which is what bounds the recovery loop, and
 	// it identifies this particular claim to the finalisation below.
@@ -172,22 +173,22 @@ func (r *Repository) ClaimPending(ctx context.Context) (domain.QuoteUpdate, bool
 		 )
 		RETURNING id, pair, status, attempts, COALESCE(error, ''), created_at, updated_at`
 
-	u, err := scanUpdate(r.pool.QueryRow(ctx, query))
+	t, err := scanTask(r.pool.QueryRow(ctx, query))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.QuoteUpdate{}, false, nil
+		return domain.UpdateTask{}, false, nil
 	}
 	if err != nil {
-		return domain.QuoteUpdate{}, false, fmt.Errorf("claim pending update: %w", err)
+		return domain.UpdateTask{}, false, fmt.Errorf("claim task: %w", err)
 	}
 
-	return u, true, nil
+	return t, true, nil
 }
 
-// Complete stores the fetched rate and closes the task in one transaction: a
-// quote whose task is not finished would be served by GET /quotes/latest under
-// an update that still claims to be running.
+// CompleteTask stores the fetched rate and closes the task in one transaction:
+// a quote whose task is not finished would be served by GET /quotes/latest
+// under a task that still claims to be running.
 //
-// claim must be the task as ClaimPending returned it. Its attempts value
+// claim must be the task as ClaimTask returned it. Its attempts value
 // identifies that claim, and the statement matches on it, so a worker whose
 // task was taken away by the recovery pass -- and possibly claimed by someone
 // else since, which restores the status and leaves a status check alone
@@ -198,9 +199,9 @@ func (r *Repository) ClaimPending(ctx context.Context) (domain.QuoteUpdate, bool
 //
 // The task is closed before the quote is inserted, so that a lost claim leaves
 // no row behind in quotes.
-func (r *Repository) Complete(
+func (r *Repository) CompleteTask(
 	ctx context.Context,
-	claim domain.QuoteUpdate,
+	claim domain.UpdateTask,
 	rate decimal.Decimal,
 	rateDate time.Time,
 	fetchedAt time.Time,
@@ -221,37 +222,38 @@ func (r *Repository) Complete(
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("complete update %s: begin: %w", claim.ID, err)
+		return fmt.Errorf("complete task %s: begin: %w", claim.ID, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag, err := tx.Exec(ctx, closeTask, claim.ID, claim.Attempts)
 	if err != nil {
-		return fmt.Errorf("complete update %s: close task: %w", claim.ID, err)
+		return fmt.Errorf("complete task %s: close task: %w", claim.ID, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("complete update %s: %w", claim.ID, domain.ErrStaleClaim)
+		return fmt.Errorf("complete task %s: %w", claim.ID, domain.ErrStaleClaim)
 	}
 
 	if _, err := tx.Exec(ctx, insertQuote, claim.ID, claim.Pair, rate.String(), rateDate, fetchedAt); err != nil {
-		return fmt.Errorf("complete update %s: insert quote: %w", claim.ID, err)
+		return fmt.Errorf("complete task %s: insert quote: %w", claim.ID, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("complete update %s: commit: %w", claim.ID, err)
+		return fmt.Errorf("complete task %s: commit: %w", claim.ID, err)
 	}
 
 	return nil
 }
 
-// Fail closes the task as failed with reason, which is served to clients as
+// FailTask closes the task as failed with reason, which is served to clients as
 // is: it has to be a normalised message, never a raw provider error or an
-// upstream URL.
+// upstream URL. The caller owns that wording, since what a client reads is a
+// decision of the layer above this one.
 //
-// claim carries the same proof of ownership as in Complete, and a lost claim
-// is reported the same way. Failing a task that is no longer ours would
+// claim carries the same proof of ownership as in CompleteTask, and a lost
+// claim is reported the same way. Failing a task that is no longer ours would
 // overwrite the state of whoever holds it now.
-func (r *Repository) Fail(ctx context.Context, claim domain.QuoteUpdate, reason string) error {
+func (r *Repository) FailTask(ctx context.Context, claim domain.UpdateTask, reason string) error {
 	const query = `
 		UPDATE quote_updates
 		   SET status     = 'failed',
@@ -262,39 +264,53 @@ func (r *Repository) Fail(ctx context.Context, claim domain.QuoteUpdate, reason 
 	// The schema requires a failed task to carry a reason; an empty string
 	// satisfies that constraint while telling a client nothing.
 	if reason == "" {
-		return fmt.Errorf("fail update %s: reason is empty", claim.ID)
+		return fmt.Errorf("fail task %s: reason is empty", claim.ID)
 	}
 
 	tag, err := r.pool.Exec(ctx, query, claim.ID, claim.Attempts, reason)
 	if err != nil {
-		return fmt.Errorf("fail update %s: %w", claim.ID, err)
+		return fmt.Errorf("fail task %s: %w", claim.ID, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("fail update %s: %w", claim.ID, domain.ErrStaleClaim)
+		return fmt.Errorf("fail task %s: %w", claim.ID, domain.ErrStaleClaim)
 	}
 
 	return nil
 }
 
-// ReleaseStuck deals with tasks left in progress by a worker that died before
-// finalising them: nothing releases those on their own, since the row lock
-// disappeared along with the process. A task counts as stuck once it has been
-// in progress for longer than olderThan.
+// ReleaseStuckTasks deals with tasks left in progress by a worker that died
+// before finalising them: nothing releases those on their own, since the row
+// lock disappeared along with the process. A task counts as stuck once it has
+// been in progress for longer than olderThan.
 //
 // Tasks below maxAttempts go back to the queue; those that have reached it are
 // closed as failed with reason, which is what stops a task that reliably kills
-// its worker from cycling between claim and release forever.
+// its worker from cycling between claim and release forever. All three are
+// settings rather than constants, and they arrive as arguments because the
+// caller is the one holding the configuration: how long to wait, how many
+// claims to allow and what to tell a client are not decisions for storage.
+//
+// The two counts are returned apart because they mean different things to
+// whoever logs them. A steady trickle of releases says workers are dying or
+// that the threshold is too tight; a failure says one task keeps killing
+// whoever picks it up. A single total would hide both.
 //
 // The two statements share one transaction so that both partition the table at
 // the same instant: now() is the transaction's start time, not the statement's.
 // Age is measured by the database clock throughout -- a cutoff computed here
 // would weigh the database's timestamps against this container's clock.
-func (r *Repository) ReleaseStuck(
+func (r *Repository) ReleaseStuckTasks(
 	ctx context.Context,
 	olderThan time.Duration,
 	maxAttempts int,
 	reason string,
 ) (released, failed int, err error) {
+	// The cutoff is now() minus an interval built from $1 seconds. Written this
+	// way the column stays bare on the left and the right side is one value for
+	// the whole transaction, so the partial index on updated_at serves the
+	// condition as a range. Turned around -- extracting each row's age and
+	// comparing that to $1 -- it would be an expression over the column, and
+	// every row would have to be computed.
 	const releaseQuery = `
 		UPDATE quote_updates
 		   SET status     = 'pending',
@@ -315,12 +331,12 @@ func (r *Repository) ReleaseStuck(
 		   AND updated_at < now() - make_interval(secs => $1)`
 
 	if reason == "" {
-		return 0, 0, errors.New("release stuck updates: reason is empty")
+		return 0, 0, errors.New("release stuck tasks: reason is empty")
 	}
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return 0, 0, fmt.Errorf("release stuck updates: begin: %w", err)
+		return 0, 0, fmt.Errorf("release stuck tasks: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -328,29 +344,29 @@ func (r *Repository) ReleaseStuck(
 
 	releaseTag, err := tx.Exec(ctx, releaseQuery, seconds, maxAttempts)
 	if err != nil {
-		return 0, 0, fmt.Errorf("release stuck updates: release: %w", err)
+		return 0, 0, fmt.Errorf("release stuck tasks: release: %w", err)
 	}
 
 	abandonTag, err := tx.Exec(ctx, abandonQuery, seconds, maxAttempts, reason)
 	if err != nil {
-		return 0, 0, fmt.Errorf("release stuck updates: abandon: %w", err)
+		return 0, 0, fmt.Errorf("release stuck tasks: abandon: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, 0, fmt.Errorf("release stuck updates: commit: %w", err)
+		return 0, 0, fmt.Errorf("release stuck tasks: commit: %w", err)
 	}
 
 	return int(releaseTag.RowsAffected()), int(abandonTag.RowsAffected()), nil
 }
 
-// scanUpdate reads the columns of quote_updates in the order the queries above
+// scanTask reads the columns of quote_updates in the order the queries above
 // list them.
-func scanUpdate(row pgx.Row) (domain.QuoteUpdate, error) {
-	var u domain.QuoteUpdate
+func scanTask(row pgx.Row) (domain.UpdateTask, error) {
+	var t domain.UpdateTask
 
-	if err := row.Scan(&u.ID, &u.Pair, &u.Status, &u.Attempts, &u.Error, &u.CreatedAt, &u.UpdatedAt); err != nil {
-		return domain.QuoteUpdate{}, err
+	if err := row.Scan(&t.ID, &t.Pair, &t.Status, &t.Attempts, &t.Error, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		return domain.UpdateTask{}, err
 	}
 
-	return u, nil
+	return t, nil
 }

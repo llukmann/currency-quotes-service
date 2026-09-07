@@ -22,8 +22,12 @@ type Quote struct {
 	// trip through binary floating point is a coincidence, not a guarantee.
 	Rate decimal.Decimal
 	// RateDate is the day the rate is valid for, as reported by the provider.
-	// Only the date part is meaningful -- the provider publishes no instant --
-	// so the value is midnight UTC and is formatted without a time.
+	// Only the date part means anything: the provider publishes no instant at
+	// all. Go has no date-only type and this field cannot enforce one, but both
+	// boundaries do -- the value is parsed from a bare date, so it starts as
+	// midnight UTC, and the column holding it is a date, so a round trip
+	// returns midnight UTC as well. It is served formatted, never marshalled
+	// as a timestamp.
 	RateDate time.Time
 	// FetchedAt is when this service received the rate. It can be days after
 	// RateDate: reference rates are published on working days only, and a
