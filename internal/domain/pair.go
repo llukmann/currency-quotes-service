@@ -54,3 +54,23 @@ func ParsePair(s string) (Pair, error) {
 
 	return Pair(base + "/" + quote), nil
 }
+
+// Currencies splits the pair into its base and quote currency.
+//
+// It cannot fail, and that is why it lives here rather than in the package that
+// needs it: every Pair comes from ParsePair, which is what guarantees the shape
+// relied on below. A split written next to the provider would have to deal with
+// a malformed value that cannot reach it, or silently assume it cannot -- far
+// from the constructor that makes the assumption true.
+//
+// That guarantee is a convention rather than a rule the compiler enforces: the
+// type is exported, so Pair("EUR") compiles, and this method would answer with
+// two empty strings. The invariant is held the same way quotes.pair is held --
+// by there being exactly one writer -- and it fails the same gentle way: the
+// request goes out with empty currencies and the upstream rejects it, rather
+// than a wrong rate being stored.
+func (p Pair) Currencies() (base, quote string) {
+	base, quote, _ = strings.Cut(string(p), "/")
+
+	return base, quote
+}
