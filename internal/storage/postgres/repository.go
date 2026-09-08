@@ -278,6 +278,35 @@ func (r *Repository) FailTask(ctx context.Context, claim domain.UpdateTask, reas
 	return nil
 }
 
+// ReleaseTask puts a claimed task back in the queue, for a worker that is
+// giving it up rather than finishing it: on shutdown the task did not fail and
+// nobody is at fault, so failing it would tell a client the provider was.
+//
+// claim carries the same proof of ownership as the two above, and for the same
+// reason: without it a worker leaving late would take the task away from
+// whoever claimed it after the recovery pass released it.
+//
+// attempts is not decremented. It counts how many times processing was
+// started, and one start did happen; the recovery pass leaves it alone for the
+// same reason, and the next claim is what moves it on.
+func (r *Repository) ReleaseTask(ctx context.Context, claim domain.UpdateTask) error {
+	const query = `
+		UPDATE quote_updates
+		   SET status     = 'pending',
+		       updated_at = now()
+		 WHERE id = $1 AND status = 'in_progress' AND attempts = $2`
+
+	tag, err := r.pool.Exec(ctx, query, claim.ID, claim.Attempts)
+	if err != nil {
+		return fmt.Errorf("release task %s: %w", claim.ID, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("release task %s: %w", claim.ID, domain.ErrStaleClaim)
+	}
+
+	return nil
+}
+
 // ReleaseStuckTasks deals with tasks left in progress by a worker that died
 // before finalising them: nothing releases those on their own, since the row
 // lock disappeared along with the process. A task counts as stuck once it has
