@@ -84,9 +84,16 @@ func run() error {
 	)
 
 	repo := postgres.NewRepository(pool)
-	svc := service.New(repo)
 
-	quotes := worker.New(repo, rates, worker.Settings{
+	// The signal that a task has just been posted: written by the handler path,
+	// read by whichever worker is idle. Buffered by one and written without
+	// blocking, so it says "the queue is worth a look" rather than counting
+	// anything -- see Service.notify.
+	wake := make(chan struct{}, 1)
+
+	svc := service.New(repo, wake)
+
+	quotes := worker.New(repo, rates, wake, worker.Settings{
 		TaskTimeout:      cfg.WorkerTaskTimeout,
 		PollInterval:     cfg.WorkerPollInterval,
 		ProviderAttempts: cfg.ProviderAttempts,
