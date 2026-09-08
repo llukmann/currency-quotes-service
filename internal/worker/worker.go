@@ -192,19 +192,7 @@ func (w *Worker) process(ctx context.Context, claim domain.UpdateTask) {
 	}
 
 	if err := w.repo.CompleteTask(ctx, claim, rate.Value, rate.Date, fetchedAt); err != nil {
-		if errors.Is(err, domain.ErrStaleClaim) {
-			// The task is someone else's now. Storing the rate anyway would
-			// attach it to an update that is running or queued again, and
-			// GET /quotes/latest would serve a rate for work not yet done.
-			log.Warn("claim lost, rate discarded", slog.Any("error", err))
-
-			return
-		}
-
-		// The task stays in_progress and the recovery pass will release it.
-		// Reporting it as failed is not an option: the rate is good and the
-		// client would be told the provider was at fault.
-		log.Error("complete task", slog.Any("error", err))
+		w.finalisationFailed(ctx, log, claim, "complete task", err)
 
 		return
 	}
@@ -225,13 +213,34 @@ func (w *Worker) fail(ctx context.Context, log *slog.Logger, claim domain.Update
 	log.Error("fetch rate", slog.Any("error", fetchErr), slog.String("reason", reason))
 
 	if err := w.repo.FailTask(ctx, claim, reason); err != nil {
-		if errors.Is(err, domain.ErrStaleClaim) {
-			log.Warn("claim lost, failure discarded", slog.Any("error", err))
+		w.finalisationFailed(ctx, log, claim, "fail task", err)
+	}
+}
 
-			return
-		}
+// finalisationFailed deals with a finalising statement that did not go
+// through, whichever of the two it was.
+//
+// A lost claim is the end of it: the task belongs to someone else, and what
+// this worker was about to record about it is void.
+//
+// Anything else leaves the task in progress, and then it matters why. A
+// cancelled context means the write failed because the service is shutting
+// down, which is the same situation as a cancellation during the provider call
+// and deserves the same answer: the claim goes back. Releasing is safe even if
+// the finalisation did commit and only its answer was lost -- ReleaseTask
+// matches on status and on the claim token, so a task already closed is left
+// alone and reported as a stale claim.
+func (w *Worker) finalisationFailed(ctx context.Context, log *slog.Logger, claim domain.UpdateTask, op string, err error) {
+	if errors.Is(err, domain.ErrStaleClaim) {
+		log.Warn("claim lost, result discarded", slog.String("op", op), slog.Any("error", err))
 
-		log.Error("fail task", slog.Any("error", err))
+		return
+	}
+
+	log.Error(op, slog.Any("error", err))
+
+	if errors.Is(ctx.Err(), context.Canceled) {
+		w.release(ctx, log, claim)
 	}
 }
 
