@@ -18,7 +18,9 @@ import (
 
 	"github.com/llukmann/currency-quotes-service/internal/api"
 	"github.com/llukmann/currency-quotes-service/internal/config"
+	"github.com/llukmann/currency-quotes-service/internal/provider"
 	"github.com/llukmann/currency-quotes-service/internal/storage/postgres"
+	"github.com/llukmann/currency-quotes-service/internal/worker"
 )
 
 func main() {
@@ -63,6 +65,20 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// The retrier is what the worker holds: how many times an upstream is asked
+	// is a property of the call, not a decision the worker makes each time.
+	rates := provider.NewRetrier(
+		provider.NewClient(cfg.ProviderBaseURL, cfg.ProviderTimeout),
+		cfg.ProviderAttempts,
+		cfg.ProviderBackoff,
+	)
+
+	quotes := worker.New(postgres.NewRepository(pool), rates, worker.Settings{
+		TaskTimeout:      cfg.WorkerTaskTimeout,
+		PollInterval:     cfg.WorkerPollInterval,
+		ProviderAttempts: cfg.ProviderAttempts,
+	}, logger)
+
 	srv := &http.Server{
 		Addr:         net.JoinHostPort("", strconv.Itoa(cfg.HTTPPort)),
 		Handler:      api.NewRouter(),
@@ -80,6 +96,12 @@ func run() error {
 		}
 
 		return nil
+	})
+
+	g.Go(func() error {
+		logger.Info("worker started")
+
+		return quotes.Run(ctx)
 	})
 
 	g.Go(func() error {
