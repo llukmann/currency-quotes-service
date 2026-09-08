@@ -73,10 +73,18 @@ func run() error {
 		cfg.ProviderBackoff,
 	)
 
-	quotes := worker.New(postgres.NewRepository(pool), rates, worker.Settings{
+	repo := postgres.NewRepository(pool)
+
+	quotes := worker.New(repo, rates, worker.Settings{
 		TaskTimeout:      cfg.WorkerTaskTimeout,
 		PollInterval:     cfg.WorkerPollInterval,
 		ProviderAttempts: cfg.ProviderAttempts,
+	}, logger)
+
+	recovery := worker.NewRecovery(repo, worker.RecoverySettings{
+		Interval:     cfg.WorkerRecoveryInterval,
+		StuckTimeout: cfg.WorkerStuckTimeout,
+		MaxAttempts:  cfg.WorkerMaxAttempts,
 	}, logger)
 
 	srv := &http.Server{
@@ -107,6 +115,8 @@ func run() error {
 	for range cfg.WorkerConcurrency {
 		g.Go(func() error { return quotes.Run(ctx) })
 	}
+
+	g.Go(func() error { return recovery.Run(ctx) })
 
 	g.Go(func() error {
 		<-ctx.Done()
