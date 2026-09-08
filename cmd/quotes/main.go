@@ -13,11 +13,14 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/llukmann/currency-quotes-service/internal/api"
 	"github.com/llukmann/currency-quotes-service/internal/config"
+	"github.com/llukmann/currency-quotes-service/internal/provider"
 	"github.com/llukmann/currency-quotes-service/internal/storage/postgres"
+	"github.com/llukmann/currency-quotes-service/internal/worker"
 )
 
 func main() {
@@ -33,12 +36,21 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// The budget of one provider call, which only the provider package can work
+	// out: the jitter window is part of its retry schedule. Checked here, where
+	// both packages are already in hand, so that the configuration stays a leaf
+	// of the dependency graph.
+	providerBudget := provider.Budget(cfg.ProviderAttempts, cfg.ProviderTimeout, cfg.ProviderBackoff)
+	if err := cfg.CheckTimeouts(providerBudget); err != nil {
+		return fmt.Errorf("check config: %w", err)
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
 
 	// Cancelled on SIGINT/SIGTERM. The errgroup derives its own context from
 	// this one, which is also cancelled by the first error of any goroutine in
-	// the group. The workers will join the same group in step 4.
+	// the group: the server, the workers and the recovery pass.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -47,6 +59,42 @@ func run() error {
 	if err := postgres.Migrate(ctx, cfg.DatabaseURL, logger); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+
+	// Sized by pool_max_conns in the connection string, so there is no setting
+	// of ours to pass here. No ping either: the migration above just proved the
+	// database is reachable, and pgxpool opens its connections on demand.
+	//
+	// Closed by the deferred call rather than by whoever uses it, and that
+	// happens after the group below has been waited on -- a pool closed while
+	// a worker still holds a connection would fail the very finalisation the
+	// shutdown is waiting for.
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer pool.Close()
+
+	// The retrier is what the worker holds: how many times an upstream is asked
+	// is a property of the call, not a decision the worker makes each time.
+	rates := provider.NewRetrier(
+		provider.NewClient(cfg.ProviderBaseURL, cfg.ProviderTimeout),
+		cfg.ProviderAttempts,
+		cfg.ProviderBackoff,
+	)
+
+	repo := postgres.NewRepository(pool)
+
+	quotes := worker.New(repo, rates, worker.Settings{
+		TaskTimeout:      cfg.WorkerTaskTimeout,
+		PollInterval:     cfg.WorkerPollInterval,
+		ProviderAttempts: cfg.ProviderAttempts,
+	}, logger)
+
+	recovery := worker.NewRecovery(repo, worker.RecoverySettings{
+		Interval:     cfg.WorkerRecoveryInterval,
+		StuckTimeout: cfg.WorkerStuckTimeout,
+		MaxAttempts:  cfg.WorkerMaxAttempts,
+	}, logger)
 
 	srv := &http.Server{
 		Addr:         net.JoinHostPort("", strconv.Itoa(cfg.HTTPPort)),
@@ -66,6 +114,18 @@ func run() error {
 
 		return nil
 	})
+
+	// One instance behind all of them: a worker holds nothing that changes, and
+	// the arbitration is the queue's own -- claiming is a single statement with
+	// SKIP LOCKED, so two goroutines asking at once get two different tasks
+	// rather than one of them waiting.
+	logger.Info("worker pool started", slog.Int("size", cfg.WorkerConcurrency))
+
+	for range cfg.WorkerConcurrency {
+		g.Go(func() error { return quotes.Run(ctx) })
+	}
+
+	g.Go(func() error { return recovery.Run(ctx) })
 
 	g.Go(func() error {
 		<-ctx.Done()

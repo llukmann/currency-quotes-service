@@ -128,6 +128,65 @@ func TestRetrierFetchRate(t *testing.T) {
 	}
 }
 
+// TestBudget pins the worst case to concrete numbers, because that is what the
+// startup invariant on WORKER_TASK_TIMEOUT is compared against. Widening the
+// jitter window or changing how the pauses grow moves these figures, and this
+// is where that has to be noticed: the check would otherwise keep passing on a
+// budget that had become too small.
+func TestBudget(t *testing.T) {
+	tests := []struct {
+		name     string
+		attempts int
+		timeout  time.Duration
+		backoff  time.Duration
+		want     time.Duration
+	}{
+		{
+			name:     "a single attempt is the timeout alone",
+			attempts: 1,
+			timeout:  3 * time.Second,
+			backoff:  200 * time.Millisecond,
+			want:     3 * time.Second,
+		},
+		{
+			// The configured default: three requests of three seconds, plus
+			// pauses of at most 300ms and 600ms.
+			name:     "the configured schedule",
+			attempts: 3,
+			timeout:  3 * time.Second,
+			backoff:  200 * time.Millisecond,
+			want:     9900 * time.Millisecond,
+		},
+		{
+			name:     "pauses double and each is taken at the top of its window",
+			attempts: 4,
+			timeout:  time.Second,
+			backoff:  100 * time.Millisecond,
+			want:     5050 * time.Millisecond,
+		},
+		{
+			name:     "an attempt count below one is raised to one",
+			attempts: 0,
+			timeout:  3 * time.Second,
+			backoff:  200 * time.Millisecond,
+			want:     3 * time.Second,
+		},
+		{
+			name:     "no backoff leaves only the requests",
+			attempts: 3,
+			timeout:  time.Second,
+			backoff:  0,
+			want:     3 * time.Second,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, Budget(tt.attempts, tt.timeout, tt.backoff))
+		})
+	}
+}
+
 // TestJitteredStaysInItsWindow pins the formula rather than the draw. The
 // window is what the spread is for: a factor that could come out at or below
 // zero would collapse the backoff, and one drawn from [0,1) would only ever
