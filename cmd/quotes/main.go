@@ -19,6 +19,7 @@ import (
 	"github.com/llukmann/currency-quotes-service/internal/api"
 	"github.com/llukmann/currency-quotes-service/internal/config"
 	"github.com/llukmann/currency-quotes-service/internal/provider"
+	"github.com/llukmann/currency-quotes-service/internal/service"
 	"github.com/llukmann/currency-quotes-service/internal/storage/postgres"
 	"github.com/llukmann/currency-quotes-service/internal/worker"
 )
@@ -83,6 +84,7 @@ func run() error {
 	)
 
 	repo := postgres.NewRepository(pool)
+	svc := service.New(repo)
 
 	quotes := worker.New(repo, rates, worker.Settings{
 		TaskTimeout:      cfg.WorkerTaskTimeout,
@@ -98,9 +100,14 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:         net.JoinHostPort("", strconv.Itoa(cfg.HTTPPort)),
-		Handler:      api.NewRouter(),
+		Handler:      api.NewRouter(svc, logger, cfg.HandlerTimeout()),
 		ReadTimeout:  cfg.HTTPReadTimeout,
 		WriteTimeout: cfg.HTTPWriteTimeout,
+		// Everything net/http reports on its own -- a malformed request line, a
+		// panic our middleware never saw -- goes through the same handler as
+		// the rest of the service. Left unset it writes plain text to stderr,
+		// which is the one thing that breaks a stream of JSON logs.
+		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
