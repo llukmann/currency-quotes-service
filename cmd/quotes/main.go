@@ -98,11 +98,15 @@ func run() error {
 		return nil
 	})
 
-	g.Go(func() error {
-		logger.Info("worker started")
+	// One instance behind all of them: a worker holds nothing that changes, and
+	// the arbitration is the queue's own -- claiming is a single statement with
+	// SKIP LOCKED, so two goroutines asking at once get two different tasks
+	// rather than one of them waiting.
+	logger.Info("worker pool started", slog.Int("size", cfg.WorkerConcurrency))
 
-		return quotes.Run(ctx)
-	})
+	for range cfg.WorkerConcurrency {
+		g.Go(func() error { return quotes.Run(ctx) })
+	}
 
 	g.Go(func() error {
 		<-ctx.Done()
