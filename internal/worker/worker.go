@@ -52,6 +52,10 @@ type repository interface {
 // task is not lost -- it stays in progress and the recovery pass has it.
 const releaseTimeout = 5 * time.Second
 
+// claimFailureReportInterval is how often a worker repeats itself while the
+// queue cannot be reached at all. See Run.
+const claimFailureReportInterval = time.Minute
+
 // rateProvider is the provider as seen from here: one call, no retry policy of
 // its own to expose. Both the bare client and the retrying decorator satisfy
 // it, and a worker cannot tell which one it holds.
@@ -97,12 +101,29 @@ func New(repo repository, rates rateProvider, settings Settings, logger *slog.Lo
 // interval is for, and step 5 adds the signal that shortens it when a task has
 // just been posted.
 func (w *Worker) Run(ctx context.Context) error {
+	// A database that is briefly unreachable is not worth stopping the service
+	// for: the loop waits out the interval and asks again. Saying so every time
+	// would bury the incident under its own symptom, since every worker polls --
+	// four of them at a one second interval write four lines a second for as
+	// long as the outage lasts. The first failure is reported, then one a
+	// minute, and the recovery counts what was lost, which is the figure that
+	// says how long it went on.
+	var failures int
+	var lastReport time.Time
+
 	for ctx.Err() == nil {
 		claimed, err := w.claimAndProcess(ctx)
-		if err != nil {
-			// A database that is briefly unreachable is not worth stopping the
-			// service for: the loop waits out the interval and asks again.
-			w.logger.Error("claim task", slog.Any("error", err))
+
+		switch {
+		case err != nil:
+			failures++
+			if failures == 1 || time.Since(lastReport) >= claimFailureReportInterval {
+				w.logger.Error("claim task", slog.Any("error", err), slog.Int("failed_polls", failures))
+				lastReport = time.Now()
+			}
+		case failures > 0:
+			w.logger.Info("claim recovered", slog.Int("failed_polls", failures))
+			failures = 0
 		}
 
 		if claimed {
