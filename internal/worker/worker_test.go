@@ -238,7 +238,7 @@ func TestWorkerClaimAndProcess(t *testing.T) {
 
 			before := time.Now().UTC()
 
-			claimed, err := New(repo, rates, testSettings(tt.taskTimeout), discardLogger()).claimAndProcess(ctx)
+			claimed, err := New(repo, rates, nil, testSettings(tt.taskTimeout), discardLogger()).claimAndProcess(ctx)
 
 			require.NoError(t, err)
 			require.True(t, claimed)
@@ -279,7 +279,7 @@ func TestWorkerClaimAndProcessEmptyQueue(t *testing.T) {
 	repo := &stubRepo{}
 	rates := &stubProvider{}
 
-	claimed, err := New(repo, rates, testSettings(time.Second), discardLogger()).claimAndProcess(t.Context())
+	claimed, err := New(repo, rates, nil, testSettings(time.Second), discardLogger()).claimAndProcess(t.Context())
 
 	require.NoError(t, err)
 	require.False(t, claimed)
@@ -295,7 +295,7 @@ func TestWorkerClaimAndProcessClaimFails(t *testing.T) {
 	repo := &stubRepo{claimErr: errors.New("connection refused")}
 	rates := &stubProvider{}
 
-	claimed, err := New(repo, rates, testSettings(time.Second), discardLogger()).claimAndProcess(t.Context())
+	claimed, err := New(repo, rates, nil, testSettings(time.Second), discardLogger()).claimAndProcess(t.Context())
 
 	require.Error(t, err)
 	require.False(t, claimed)
@@ -311,5 +311,5 @@ func TestWorkerRunStopsWithTheContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	require.NoError(t, New(repo, &stubProvider{}, testSettings(time.Second), discardLogger()).Run(ctx))
+	require.NoError(t, New(repo, &stubProvider{}, nil, testSettings(time.Second), discardLogger()).Run(ctx))
 }

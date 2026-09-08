@@ -84,22 +84,30 @@ type Settings struct {
 type Worker struct {
 	repo     repository
 	rates    rateProvider
+	wake     <-chan struct{}
 	settings Settings
 	logger   *slog.Logger
 }
 
 // New returns a worker reading from repo and rates.
-func New(repo repository, rates rateProvider, settings Settings, logger *slog.Logger) *Worker {
-	return &Worker{repo: repo, rates: rates, settings: settings, logger: logger}
+//
+// wake is the signal that a task has just been posted, shared by the whole
+// pool; see Run. A nil channel is legal and means the worker only polls, which
+// is what the tests of the loop below rely on.
+func New(repo repository, rates rateProvider, wake <-chan struct{}, settings Settings, logger *slog.Logger) *Worker {
+	return &Worker{repo: repo, rates: rates, wake: wake, settings: settings, logger: logger}
 }
 
 // Run claims and processes tasks until ctx is done, which is a shutdown rather
 // than a failure and so returns nil.
 //
 // A processed task is followed by another claim straight away: the queue is
-// only asked to wait when it turns out to be empty. Polling at all is what the
-// interval is for, and step 5 adds the signal that shortens it when a task has
-// just been posted.
+// only asked to wait when it turns out to be empty. An idle worker then waits
+// for whichever comes first, the poll interval or a signal that a task has
+// just been posted. The signal is what makes the service feel immediate, and
+// the interval is what makes it correct: a task posted by another process, or
+// one handed back by the recovery pass, has nobody to send the signal, and
+// waiting for it alone would leave such a task sitting until the next post.
 func (w *Worker) Run(ctx context.Context) error {
 	// A database that is briefly unreachable is not worth stopping the service
 	// for: the loop waits out the interval and asks again. Saying so every time
@@ -132,6 +140,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
+		case <-w.wake:
 		case <-time.After(w.settings.PollInterval):
 		}
 	}
