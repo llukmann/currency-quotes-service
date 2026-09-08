@@ -38,6 +38,14 @@ const (
 	maxPort = 65535
 )
 
+// handlerTimeoutMargin is how much of HTTP_WRITE_TIMEOUT is kept back from the
+// deadline of a request, so that a handler which runs out of time still has
+// room to write its answer. Without the gap the two deadlines would expire
+// together and the server would drop the connection in the middle of the very
+// error the deadline was meant to produce, leaving a client that saw a broken
+// connection where the contract promises an envelope.
+const handlerTimeoutMargin = time.Second
+
 // stuckTimeoutMargin is how many task deadlines a task may spend in_progress
 // before the recovery pass treats it as abandoned. Plain "longer than one
 // deadline" would not do: the deadline is measured by this process, the
@@ -149,11 +157,12 @@ func Load() (Config, error) {
 }
 
 // CheckTimeouts rejects a combination of settings that cannot hold together, so
-// that the service refuses to start rather than misbehave later: a task
-// deadline too short for a full retry schedule would cut the provider off
-// halfway through every slow call, and a staleness threshold too close to that
-// deadline would have the recovery pass take tasks away from workers that are
-// still working on them.
+// that the service refuses to start rather than misbehave later: a write
+// timeout with no room for a handler deadline under it would leave requests
+// unbounded, a task deadline too short for a full retry schedule would cut the
+// provider off halfway through every slow call, and a staleness threshold too
+// close to that deadline would have the recovery pass take tasks away from
+// workers that are still working on them.
 //
 // providerBudget is the longest a single provider call can take, retries and
 // backoff included. It is passed in rather than worked out here so that this
@@ -161,6 +170,13 @@ func Load() (Config, error) {
 // that owns the retry schedule, and the caller that builds a provider is
 // holding both. Load does not call this -- main does, once, right after it.
 func (c Config) CheckTimeouts(providerBudget time.Duration) error {
+	if c.HTTPWriteTimeout <= handlerTimeoutMargin {
+		return fmt.Errorf(
+			"HTTP_WRITE_TIMEOUT: %s leaves nothing above the %s reserved for writing the answer",
+			c.HTTPWriteTimeout, handlerTimeoutMargin,
+		)
+	}
+
 	if c.WorkerTaskTimeout <= providerBudget {
 		return fmt.Errorf(
 			"WORKER_TASK_TIMEOUT: %s does not cover the provider budget of %s, leaving nothing for the finalising transaction",
@@ -176,6 +192,18 @@ func (c Config) CheckTimeouts(providerBudget time.Duration) error {
 	}
 
 	return nil
+}
+
+// HandlerTimeout is the deadline of a single request, bounding everything a
+// handler does: it is what stops a query against an unreachable database from
+// holding a goroutine and a pooled connection for as long as the outage lasts.
+//
+// Derived rather than configured. It has to stay strictly under
+// HTTP_WRITE_TIMEOUT, which is the point at which the server stops writing at
+// all, and a variable of its own would let the two be set the wrong way round.
+// CheckTimeouts is what guarantees the result is positive.
+func (c Config) HandlerTimeout() time.Duration {
+	return c.HTTPWriteTimeout - handlerTimeoutMargin
 }
 
 // requiredFromEnv reads a variable that has no meaningful default. Connecting
