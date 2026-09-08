@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/llukmann/currency-quotes-service/internal/api"
@@ -47,6 +48,20 @@ func run() error {
 	if err := postgres.Migrate(ctx, cfg.DatabaseURL, logger); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+
+	// Sized by pool_max_conns in the connection string, so there is no setting
+	// of ours to pass here. No ping either: the migration above just proved the
+	// database is reachable, and pgxpool opens its connections on demand.
+	//
+	// Closed by the deferred call rather than by whoever uses it, and that
+	// happens after the group below has been waited on -- a pool closed while
+	// a worker still holds a connection would fail the very finalisation the
+	// shutdown is waiting for.
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect to database: %w", err)
+	}
+	defer pool.Close()
 
 	srv := &http.Server{
 		Addr:         net.JoinHostPort("", strconv.Itoa(cfg.HTTPPort)),
