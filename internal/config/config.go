@@ -7,6 +7,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/llukmann/currency-quotes-service/internal/provider"
 )
 
 // Defaults applied when the corresponding variable is unset or empty.
@@ -17,6 +19,18 @@ const (
 	defaultHTTPWriteTimeout = 10 * time.Second
 	defaultShutdownTimeout  = 10 * time.Second
 	defaultLogLevel         = slog.LevelInfo
+
+	defaultProviderBaseURL  = "https://api.frankfurter.dev"
+	defaultProviderTimeout  = 3 * time.Second
+	defaultProviderAttempts = 3
+	defaultProviderBackoff  = 200 * time.Millisecond
+
+	defaultWorkerConcurrency      = 4
+	defaultWorkerPollInterval     = time.Second
+	defaultWorkerTaskTimeout      = 15 * time.Second
+	defaultWorkerStuckTimeout     = 60 * time.Second
+	defaultWorkerRecoveryInterval = 30 * time.Second
+	defaultWorkerMaxAttempts      = 3
 )
 
 // Valid TCP port range. Port 0 is excluded: it would make the server pick an
@@ -25,6 +39,16 @@ const (
 	minPort = 1
 	maxPort = 65535
 )
+
+// stuckTimeoutMargin is how many task deadlines a task may spend in_progress
+// before the recovery pass treats it as abandoned. Plain "longer than one
+// deadline" would not do: the deadline is measured by this process, the
+// staleness threshold by the database clock, and between the claim commit and
+// the start of the deadline lie things the deadline never counted -- waiting
+// for a pooled connection, the finalising transaction itself, CPU throttling.
+// Erring high costs a delay before a dead worker's task is picked up; erring
+// low takes tasks away from workers that are still alive.
+const stuckTimeoutMargin = 2
 
 // Config holds the service parameters. Variable names are listed in
 // .env.example, which is the source of truth for them.
@@ -35,6 +59,34 @@ type Config struct {
 	HTTPWriteTimeout time.Duration
 	ShutdownTimeout  time.Duration
 	LogLevel         slog.Level
+
+	// ProviderBaseURL is the scheme and host of the rate API, without a path:
+	// the path belongs to the client that knows the API.
+	ProviderBaseURL string
+	// ProviderTimeout bounds one HTTP attempt, not the whole retry schedule.
+	ProviderTimeout  time.Duration
+	ProviderAttempts int
+	// ProviderBackoff is the pause before the second attempt, doubling before
+	// each attempt after it.
+	ProviderBackoff time.Duration
+
+	// WorkerConcurrency is how many tasks are processed at the same time.
+	WorkerConcurrency int
+	// WorkerPollInterval is how long a worker waits before asking an empty
+	// queue again.
+	WorkerPollInterval time.Duration
+	// WorkerTaskTimeout is the deadline of a single task. It covers the whole
+	// path from the claim to the finalising commit: the provider call with all
+	// of its retries, and the database work that follows it.
+	WorkerTaskTimeout time.Duration
+	// WorkerStuckTimeout is how long a task may sit in_progress before the
+	// recovery pass takes it back, see stuckTimeoutMargin.
+	WorkerStuckTimeout time.Duration
+	// WorkerRecoveryInterval is how often that pass runs.
+	WorkerRecoveryInterval time.Duration
+	// WorkerMaxAttempts is how many times a task may be claimed before the
+	// recovery pass closes it as failed instead of releasing it once more.
+	WorkerMaxAttempts int
 }
 
 // Load reads the configuration from the environment. Unset variables fall
@@ -65,7 +117,70 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	cfg.ProviderBaseURL = stringFromEnv("PROVIDER_BASE_URL", defaultProviderBaseURL)
+	if cfg.ProviderTimeout, err = durationFromEnv("PROVIDER_TIMEOUT", defaultProviderTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.ProviderAttempts, err = positiveIntFromEnv("PROVIDER_ATTEMPTS", defaultProviderAttempts); err != nil {
+		return Config{}, err
+	}
+	if cfg.ProviderBackoff, err = durationFromEnv("PROVIDER_BACKOFF", defaultProviderBackoff); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.WorkerConcurrency, err = positiveIntFromEnv("WORKER_CONCURRENCY", defaultWorkerConcurrency); err != nil {
+		return Config{}, err
+	}
+	if cfg.WorkerPollInterval, err = durationFromEnv("WORKER_POLL_INTERVAL", defaultWorkerPollInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.WorkerTaskTimeout, err = durationFromEnv("WORKER_TASK_TIMEOUT", defaultWorkerTaskTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.WorkerStuckTimeout, err = durationFromEnv("WORKER_STUCK_TIMEOUT", defaultWorkerStuckTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.WorkerRecoveryInterval, err = durationFromEnv("WORKER_RECOVERY_INTERVAL", defaultWorkerRecoveryInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.WorkerMaxAttempts, err = positiveIntFromEnv("WORKER_MAX_ATTEMPTS", defaultWorkerMaxAttempts); err != nil {
+		return Config{}, err
+	}
+
+	if err := cfg.checkTimeouts(); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
+}
+
+// checkTimeouts rejects a combination of settings that cannot hold together,
+// so that the service refuses to start rather than misbehave later: a task
+// deadline too short for a full retry schedule would cut the provider off
+// halfway through every slow call, and a staleness threshold too close to that
+// deadline would have the recovery pass take tasks away from workers that are
+// still working on them.
+func (c Config) checkTimeouts() error {
+	// The budget is computed by the package that owns the retry schedule. The
+	// jitter window is part of that schedule and part of the number, and a copy
+	// of the formula here would go stale exactly when the window changes --
+	// failing by passing, which is the wrong direction for a check.
+	budget := provider.Budget(c.ProviderAttempts, c.ProviderTimeout, c.ProviderBackoff)
+	if c.WorkerTaskTimeout <= budget {
+		return fmt.Errorf(
+			"WORKER_TASK_TIMEOUT: %s does not cover the provider budget of %s, leaving nothing for the finalising transaction",
+			c.WorkerTaskTimeout, budget,
+		)
+	}
+
+	if minStuck := stuckTimeoutMargin * c.WorkerTaskTimeout; c.WorkerStuckTimeout < minStuck {
+		return fmt.Errorf(
+			"WORKER_STUCK_TIMEOUT: %s is less than %s, which is %d times WORKER_TASK_TIMEOUT",
+			c.WorkerStuckTimeout, minStuck, stuckTimeoutMargin,
+		)
+	}
+
+	return nil
 }
 
 // requiredFromEnv reads a variable that has no meaningful default. Connecting
@@ -79,6 +194,15 @@ func requiredFromEnv(key string) (string, error) {
 	return raw, nil
 }
 
+func stringFromEnv(key, def string) string {
+	raw, ok := os.LookupEnv(key)
+	if !ok || raw == "" {
+		return def
+	}
+
+	return raw
+}
+
 func intFromEnv(key string, def int) (int, error) {
 	raw, ok := os.LookupEnv(key)
 	if !ok || raw == "" {
@@ -88,6 +212,21 @@ func intFromEnv(key string, def int) (int, error) {
 	v, err := strconv.Atoi(raw)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+
+	return v, nil
+}
+
+// positiveIntFromEnv reads a count. Zero is rejected rather than taken
+// literally: a pool of no workers, or a provider allowed no attempts, is a
+// service that quietly does nothing.
+func positiveIntFromEnv(key string, def int) (int, error) {
+	v, err := intFromEnv(key, def)
+	if err != nil {
+		return 0, err
+	}
+	if v < 1 {
+		return 0, fmt.Errorf("%s: %d is not a positive count", key, v)
 	}
 
 	return v, nil

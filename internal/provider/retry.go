@@ -56,6 +56,34 @@ func NewRetrier(next RateProvider, attempts int, backoff time.Duration) *Retrier
 	return &Retrier{next: next, attempts: attempts, backoff: backoff}
 }
 
+// Budget is the longest a Retrier built with these arguments can take: every
+// attempt spending its whole timeout, and every pause drawn at the top of its
+// jitter window.
+//
+// It lives here because the number belongs to the retry schedule, and the
+// schedule includes a jitter window this package owns. The caller that needs
+// it is the configuration, which has to refuse a task deadline too short to
+// hold a full run: computed there, the window would be either duplicated or
+// quietly left out, and a budget that came out too small would let the check
+// pass exactly when it should not.
+//
+// The loop mirrors the one in FetchRate so the two cannot drift apart.
+func Budget(attempts int, timeout, backoff time.Duration) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	total := time.Duration(attempts) * timeout
+
+	delay := backoff
+	for attempt := 2; attempt <= attempts; attempt++ {
+		total += time.Duration(float64(delay) * (jitterMin + jitterSpan))
+		delay *= 2
+	}
+
+	return total
+}
+
 // FetchRate calls the wrapped provider until it answers, an error turns out not
 // to be transient, or the attempts run out. The last transient error is what is
 // returned in that final case, still wrapping ErrTransient, so a caller can
