@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 )
@@ -58,12 +60,51 @@ func (h *handler) writeJSON(w http.ResponseWriter, r *http.Request, status int, 
 	if err := json.NewEncoder(w).Encode(body); err != nil {
 		// The status and the headers have gone out already, so the client
 		// cannot be told. None of the three response types can fail to
-		// marshal, which leaves a broken connection as the only cause.
+		// marshal, which leaves a broken connection as the only cause -- and
+		// the commonest one is the client hanging up mid-body, which is not a
+		// failure of ours either.
+		if clientGone(r.Context()) {
+			h.logAbandoned(r)
+
+			return
+		}
+
 		h.logger.Error("write response",
 			slog.Any("error", err),
 			slog.String("request_id", requestIDFrom(r.Context())),
 		)
 	}
+}
+
+// clientGone reports whether the work stopped because the client went away
+// rather than because anything of ours failed.
+//
+// Asked of the context rather than of the error, as the worker asks it: what
+// went wrong is the error's to say, but why the work stopped is the context's.
+// It is also the only reading that does not depend on how a driver chooses to
+// wrap a cancellation on the way back up.
+//
+// The two reasons cannot be confused here, which is what makes the question
+// answerable at all. requestTimeout sets a deadline, so a limit of ours always
+// arrives as context.DeadlineExceeded; a cancellation can only have come from
+// net/http closing the request context when the connection went away.
+func clientGone(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
+}
+
+// logAbandoned records a request whose client left before it was answered.
+//
+// At info, deliberately. Nothing failed: there is no answer to write and
+// nobody to write it to. Logged at error it would be a false alarm sitting in
+// the error log beside a real outage, to be told apart by hand at exactly the
+// moment nobody has time for it -- a closed tab and a database that has
+// stopped answering would look alike.
+func (h *handler) logAbandoned(r *http.Request) {
+	h.logger.Info("request abandoned by the client",
+		slog.String("request_id", requestIDFrom(r.Context())),
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+	)
 }
 
 // writeInternal answers a failure that is ours and not the client's: the cause
@@ -73,7 +114,18 @@ func (h *handler) writeJSON(w http.ResponseWriter, r *http.Request, status int, 
 // worker. Everything below this layer -- a driver's message, a statement, a
 // wrapped chain naming the operations it passed through -- is written for
 // whoever runs the service, not for whoever called it.
+//
+// A request the client abandoned does not come through here as a failure. Its
+// error is real -- everything in flight fails when the context is cancelled --
+// but it is the consequence of the client leaving, not a fault of ours, and
+// answering it would write a status into a connection that is already gone.
 func (h *handler) writeInternal(w http.ResponseWriter, r *http.Request, err error) {
+	if clientGone(r.Context()) {
+		h.logAbandoned(r)
+
+		return
+	}
+
 	h.logger.Error("request failed",
 		slog.Any("error", err),
 		slog.String("request_id", requestIDFrom(r.Context())),
