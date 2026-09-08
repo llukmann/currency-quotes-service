@@ -36,6 +36,15 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
+	// The budget of one provider call, which only the provider package can work
+	// out: the jitter window is part of its retry schedule. Checked here, where
+	// both packages are already in hand, so that the configuration stays a leaf
+	// of the dependency graph.
+	providerBudget := provider.Budget(cfg.ProviderAttempts, cfg.ProviderTimeout, cfg.ProviderBackoff)
+	if err := cfg.CheckTimeouts(providerBudget); err != nil {
+		return fmt.Errorf("check config: %w", err)
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
 

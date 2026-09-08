@@ -7,8 +7,6 @@ import (
 	"os"
 	"strconv"
 	"time"
-
-	"github.com/llukmann/currency-quotes-service/internal/provider"
 )
 
 // Defaults applied when the corresponding variable is unset or empty.
@@ -147,29 +145,26 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	if err := cfg.checkTimeouts(); err != nil {
-		return Config{}, err
-	}
-
 	return cfg, nil
 }
 
-// checkTimeouts rejects a combination of settings that cannot hold together,
-// so that the service refuses to start rather than misbehave later: a task
+// CheckTimeouts rejects a combination of settings that cannot hold together, so
+// that the service refuses to start rather than misbehave later: a task
 // deadline too short for a full retry schedule would cut the provider off
 // halfway through every slow call, and a staleness threshold too close to that
 // deadline would have the recovery pass take tasks away from workers that are
 // still working on them.
-func (c Config) checkTimeouts() error {
-	// The budget is computed by the package that owns the retry schedule. The
-	// jitter window is part of that schedule and part of the number, and a copy
-	// of the formula here would go stale exactly when the window changes --
-	// failing by passing, which is the wrong direction for a check.
-	budget := provider.Budget(c.ProviderAttempts, c.ProviderTimeout, c.ProviderBackoff)
-	if c.WorkerTaskTimeout <= budget {
+//
+// providerBudget is the longest a single provider call can take, retries and
+// backoff included. It is passed in rather than worked out here so that this
+// package depends on nothing of its own: the formula belongs to the package
+// that owns the retry schedule, and the caller that builds a provider is
+// holding both. Load does not call this -- main does, once, right after it.
+func (c Config) CheckTimeouts(providerBudget time.Duration) error {
+	if c.WorkerTaskTimeout <= providerBudget {
 		return fmt.Errorf(
 			"WORKER_TASK_TIMEOUT: %s does not cover the provider budget of %s, leaving nothing for the finalising transaction",
-			c.WorkerTaskTimeout, budget,
+			c.WorkerTaskTimeout, providerBudget,
 		)
 	}
 
