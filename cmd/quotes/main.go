@@ -41,7 +41,7 @@ func run() error {
 
 	// Cancelled on SIGINT/SIGTERM. The errgroup derives its own context from
 	// this one, which is also cancelled by the first error of any goroutine in
-	// the group. The workers will join the same group in step 4.
+	// the group: the server, the workers and the recovery pass.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
