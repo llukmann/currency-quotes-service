@@ -55,10 +55,13 @@ func requestIDFrom(ctx context.Context) string {
 // line stay at info for every status, including 500 -- the level of a line
 // nobody has to act on.
 //
-// A status of zero means the handler wrote nothing, which is what an abandoned
-// request looks like from here: the client hung up, writeInternal declined to
-// answer a connection that is gone, and net/http had nobody to send its
-// default 200 to either. The info line naming the request id says which.
+// A status of zero means the handler wrote nothing at all. That is what a
+// request abandoned before its first write looks like from here: writeInternal
+// declined to answer a connection that is gone, and net/http had nobody to
+// send its default 200 to either. It is not what every abandoned request looks
+// like -- a client that leaves once the header is out is logged with the status
+// that had already gone, since what was cut short was the body. The info line
+// carrying the same request id is what says a client left, in both cases.
 //
 // The response writer is wrapped here so that the status can be read back
 // afterwards. The wrapper is chi's rather than ours: a hand-rolled one is a

@@ -64,7 +64,7 @@ func (h *handler) writeJSON(w http.ResponseWriter, r *http.Request, status int, 
 		// the commonest one is the client hanging up mid-body, which is not a
 		// failure of ours either.
 		if clientGone(r.Context()) {
-			h.logAbandoned(r)
+			h.logAbandoned(r, err)
 
 			return
 		}
@@ -94,13 +94,21 @@ func clientGone(ctx context.Context) bool {
 
 // logAbandoned records a request whose client left before it was answered.
 //
-// At info, deliberately. Nothing failed: there is no answer to write and
-// nobody to write it to. Logged at error it would be a false alarm sitting in
-// the error log beside a real outage, to be told apart by hand at exactly the
-// moment nobody has time for it -- a closed tab and a database that has
+// At info, deliberately. Nothing of ours failed: there is no answer to write
+// and nobody to write it to. Logged at error it would be a false alarm sitting
+// in the error log beside a real outage, to be told apart by hand at exactly
+// the moment nobody has time for it -- a closed tab and a database that has
 // stopped answering would look alike.
-func (h *handler) logAbandoned(r *http.Request) {
+//
+// err is carried in all the same, and it is the reason this takes one. The two
+// can land in the same request: the database may already have been refusing
+// connections when the client hung up, and the cancellation is then merely
+// what the handler noticed first. Dropped here, that error would be written
+// down nowhere at all -- this is its last stop as surely as writeInternal is
+// for the failures it reports.
+func (h *handler) logAbandoned(r *http.Request, err error) {
 	h.logger.Info("request abandoned by the client",
+		slog.Any("error", err),
 		slog.String("request_id", requestIDFrom(r.Context())),
 		slog.String("method", r.Method),
 		slog.String("path", r.URL.Path),
@@ -121,7 +129,7 @@ func (h *handler) logAbandoned(r *http.Request) {
 // answering it would write a status into a connection that is already gone.
 func (h *handler) writeInternal(w http.ResponseWriter, r *http.Request, err error) {
 	if clientGone(r.Context()) {
-		h.logAbandoned(r)
+		h.logAbandoned(r, err)
 
 		return
 	}
