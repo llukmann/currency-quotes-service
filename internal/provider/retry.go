@@ -67,7 +67,8 @@ func NewRetrier(next RateProvider, attempts int, backoff time.Duration) *Retrier
 // quietly left out, and a budget that came out too small would let the check
 // pass exactly when it should not.
 //
-// The loop mirrors the one in FetchRate so the two cannot drift apart.
+// It reads the same schedule FetchRate sleeps through, rather than a second
+// copy of the formula that would have to be kept in step by hand.
 func Budget(attempts int, timeout, backoff time.Duration) time.Duration {
 	if attempts < 1 {
 		attempts = 1
@@ -75,13 +76,31 @@ func Budget(attempts int, timeout, backoff time.Duration) time.Duration {
 
 	total := time.Duration(attempts) * timeout
 
-	delay := backoff
-	for attempt := 2; attempt <= attempts; attempt++ {
-		total += time.Duration(float64(delay) * (jitterMin + jitterSpan))
-		delay *= 2
+	for _, pause := range backoffSchedule(attempts, backoff) {
+		total += time.Duration(float64(pause) * (jitterMin + jitterSpan))
 	}
 
 	return total
+}
+
+// backoffSchedule returns the nominal pause before each attempt after the
+// first: the base, then a doubling of it every time. The pauses actually taken
+// are these spread over their jitter window, and the longest a run can take is
+// what Budget adds up.
+func backoffSchedule(attempts int, backoff time.Duration) []time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	schedule := make([]time.Duration, 0, attempts-1)
+
+	delay := backoff
+	for range attempts - 1 {
+		schedule = append(schedule, delay)
+		delay *= 2
+	}
+
+	return schedule
 }
 
 // FetchRate calls the wrapped provider until it answers, an error turns out not
@@ -91,17 +110,17 @@ func Budget(attempts int, timeout, backoff time.Duration) time.Duration {
 func (r *Retrier) FetchRate(ctx context.Context, pair domain.Pair) (Rate, error) {
 	var lastErr error
 
-	delay := r.backoff
+	// The pauses are laid out in advance, undistorted, and the jitter is drawn
+	// as each one is taken: the schedule keeps its shape instead of drifting
+	// with whatever the previous draw happened to be. Budget adds up this same
+	// list.
+	schedule := backoffSchedule(r.attempts, r.backoff)
 
 	for attempt := 1; attempt <= r.attempts; attempt++ {
 		if attempt > 1 {
-			if err := sleep(ctx, jittered(delay)); err != nil {
+			if err := sleep(ctx, jittered(schedule[attempt-2])); err != nil {
 				return Rate{}, fmt.Errorf("fetch rate %s: %w", pair, err)
 			}
-
-			// The undistorted delay is what doubles, so the schedule keeps its
-			// shape instead of drifting with whatever each draw happened to be.
-			delay *= 2
 		}
 
 		rate, err := r.next.FetchRate(ctx, pair)
