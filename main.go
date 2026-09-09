@@ -49,12 +49,6 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Before the server accepts anything: a schema older than the binary would
-	// only surface later, as failing queries.
-	if err := postgres.Migrate(ctx, cfg.DatabaseURL, logger); err != nil {
-		return fmt.Errorf("migrate: %w", err)
-	}
-
 	// Closed by the deferred call rather than by whoever uses it, and that
 	// happens after the group below has been waited on -- a pool closed while
 	// a worker still holds a connection would fail the very finalisation the

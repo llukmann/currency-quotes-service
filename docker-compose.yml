@@ -1,5 +1,11 @@
 name: currency-quotes
 
+# The one place the connection string is written. Both the service and the
+# migration step below refer to this anchor, so credentials cannot be changed in
+# one of them and not the other. The port is the in-network one and stays 5432
+# even when POSTGRES_PORT moves the published port on the host.
+x-database-url: &database-url postgres://${POSTGRES_USER:-quotes}:${POSTGRES_PASSWORD:-quotes}@postgres:5432/${POSTGRES_DB:-quotes}?sslmode=disable
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -17,15 +23,28 @@ services:
       timeout: 3s
       retries: 10
 
+  # Applies the schema and exits. The service below waits for that exit rather
+  # than migrating on start: the binary carries no migration code and no .sql,
+  # so the schema is applied by the tool that owns the format.
+  #
+  # Runs again on every 'up' and answers 'no change' once the schema is
+  # current. It is also how the schema is applied by hand -- 'docker compose
+  # run --rm migrate', with the arguments below or with others.
+  migrate:
+    image: migrate/migrate:v4.19.1
+    volumes:
+      - ./migrations:/migrations:ro
+    command: ["-path=/migrations", "-database", *database-url, "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   quotes:
     build: .
     # Defaults are duplicated here so that docker compose up works from a
     # clean clone with no .env. An existing .env overrides them.
     environment:
-      # Assembled from the POSTGRES_* values above so that credentials have a
-      # single source. The port is the in-network one and stays 5432 even when
-      # POSTGRES_PORT moves the published port on the host.
-      DATABASE_URL: postgres://${POSTGRES_USER:-quotes}:${POSTGRES_PASSWORD:-quotes}@postgres:5432/${POSTGRES_DB:-quotes}?sslmode=disable
+      DATABASE_URL: *database-url
       HTTP_PORT: ${HTTP_PORT:-8080}
       HTTP_READ_TIMEOUT: ${HTTP_READ_TIMEOUT:-5s}
       HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-10s}
@@ -46,8 +65,8 @@ services:
     ports:
       - "${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${HTTP_PORT:-8080}/healthz"]
       interval: 5s

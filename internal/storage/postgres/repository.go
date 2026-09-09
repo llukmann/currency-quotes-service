@@ -1,3 +1,4 @@
+// Package postgres holds everything that talks to PostgreSQL.
 package postgres
 
 import (
@@ -25,15 +26,32 @@ type Repository struct {
 	pool *pgxpool.Pool
 }
 
+// pingTimeout bounds the one call this package makes before the service is
+// serving. Compose already gates the service on the postgres healthcheck, so it
+// only has to cover an unreachable or misconfigured host, not a slow boot.
+const pingTimeout = 10 * time.Second
+
 // New opens a pool against databaseURL and returns a repository over it. The
 // pool is sized by pool_max_conns in the connection string, so there is no
-// setting of ours to pass here, and it opens its connections on demand: this
-// call does not prove the database is reachable.
+// setting of ours to pass here.
+//
+// The pool opens its connections on demand, so one is asked for here: without
+// it a host that cannot be reached at all would first be reported as a failed
+// request, long after the start it should have stopped.
 //
 // The caller closes the repository, which closes the pool.
 func New(ctx context.Context, databaseURL string) (*Repository, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
+		return nil, fmt.Errorf("connect to database: %w", err)
+	}
+
+	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+	defer cancel()
+
+	if err := pool.Ping(pingCtx); err != nil {
+		pool.Close()
+
 		return nil, fmt.Errorf("connect to database: %w", err)
 	}
 

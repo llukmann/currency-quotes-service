@@ -2,8 +2,8 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"sync"
 	"testing"
@@ -30,18 +30,13 @@ import (
 // numeric to decimal.Decimal.
 const testDatabaseURL = "TEST_DATABASE_URL"
 
-// pool is shared by every test in the package, since connecting and migrating
-// per test would dominate the runtime. The tests do not run in parallel and
-// each starts from an empty schema.
+// pool is shared by every test in the package, since connecting per test would
+// dominate the runtime. The tests do not run in parallel and each starts from
+// an empty schema.
 var pool *pgxpool.Pool
-
-// dsn is the connection string the pool was opened from, kept for the tests
-// that open a connection of their own rather than borrowing this one.
-var dsn string
 
 func TestMain(m *testing.M) {
 	url := os.Getenv(testDatabaseURL)
-	dsn = url
 
 	if url == "" {
 		// Said out loud, on stderr, because the alternative is a run that
@@ -51,27 +46,37 @@ func TestMain(m *testing.M) {
 		// SQL. One line, once per package, in the output of a plain run.
 		fmt.Fprintf(os.Stderr,
 			"%s is not set: the storage tests are SKIPPED and no SQL is exercised.\n"+
-				"Point it at a database of its own to run them, see .env.example.\n",
+				"Point it at a database of its own to run them, see README.md.\n",
 			testDatabaseURL)
 
 		os.Exit(m.Run())
 	}
 
 	ctx := context.Background()
-	logger := slog.New(slog.DiscardHandler)
 
-	// Failing loudly rather than skipping. The variable was set deliberately,
-	// so a database that cannot be reached is a broken run and not an absent
-	// one -- silently skipping here is how a suite stops covering anything
-	// without anybody noticing.
-	if err := Migrate(ctx, url, logger); err != nil {
-		fmt.Fprintf(os.Stderr, "%s is set but the schema could not be prepared: %v\n", testDatabaseURL, err)
+	// Failing loudly rather than skipping, here and below. The variable was set
+	// deliberately, so a database that cannot be reached is a broken run and
+	// not an absent one -- silently skipping is how a suite stops covering
+	// anything without anybody noticing.
+	p, err := pgxpool.New(ctx, url)
+	if err == nil {
+		err = p.Ping(ctx)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s is set but the database could not be reached: %v\n", testDatabaseURL, err)
 		os.Exit(1)
 	}
 
-	p, err := pgxpool.New(ctx, url)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s is set but the pool could not be opened: %v\n", testDatabaseURL, err)
+	// Applying the migrations is not this suite's job: they are applied by the
+	// migrate service of docker compose, which is the only thing in the project
+	// that applies them. All that is checked here is that somebody did, since
+	// the alternative is every test in the package failing on a missing table.
+	if err := requireSchema(ctx, p); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"%s is set but the schema is not there: %v\n"+
+				"Apply the migrations to it first, see the Tests section of README.md.\n",
+			testDatabaseURL, err)
 		os.Exit(1)
 	}
 
@@ -80,6 +85,22 @@ func TestMain(m *testing.M) {
 	pool.Close()
 
 	os.Exit(code)
+}
+
+// requireSchema reports whether the tables these tests read and write exist.
+func requireSchema(ctx context.Context, p *pgxpool.Pool) error {
+	const query = `SELECT to_regclass('quote_updates'), to_regclass('quotes'), to_regclass('idempotency_keys')`
+
+	var updates, quotes, keys *string
+	if err := p.QueryRow(ctx, query).Scan(&updates, &quotes, &keys); err != nil {
+		return err
+	}
+
+	if updates == nil || quotes == nil || keys == nil {
+		return errors.New("one of quote_updates, quotes, idempotency_keys is missing")
+	}
+
+	return nil
 }
 
 // newRepo returns a repository over an empty schema, or skips the test when
