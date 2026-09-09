@@ -41,8 +41,8 @@ jobs:
       - name: tests without a database
         run: go test ./...
 
-      # The commands README gives a human, run as written, so that the README
-      # cannot quietly stop working.
+      # The commands .env.example gives a human, run as written, so that
+      # instructions which stop working stop the build with them.
       - name: schema
         run: |
           docker compose run --rm migrate
@@ -62,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # docker compose up --build is the first command of the README, and the
-      # jobs above never build the service image.
+      # docker compose up --build is how the stack is meant to be started,
+      # and the jobs above never build the service image.
       - name: the service image builds
         run: docker compose build quotes
