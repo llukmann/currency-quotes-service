@@ -627,3 +627,191 @@ func TestWorkerReleaseFailureIsNotFatal(t *testing.T) {
 	entry := requireEntry(t, records(), "task left in progress")
 	require.Equal(t, slog.LevelWarn, entry.level())
 }
+
+// loopRepo is the queue as the polling loop sees it: one scripted answer per
+// claim, and a count that a test can watch while the loop is still running.
+//
+// Separate from stubRepo because the loop runs in a goroutine of its own, so
+// everything it touches has to be safe to read from the test at the same time.
+type loopRepo struct {
+	mu      sync.Mutex
+	calls   int
+	onClaim func(call int) (domain.UpdateTask, bool, error)
+}
+
+func (l *loopRepo) ClaimTask(context.Context) (domain.UpdateTask, bool, error) {
+	l.mu.Lock()
+	l.calls++
+	call := l.calls
+	l.mu.Unlock()
+
+	return l.onClaim(call)
+}
+
+func (l *loopRepo) claims() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.calls
+}
+
+func (l *loopRepo) CompleteTask(context.Context, domain.UpdateTask, decimal.Decimal, time.Time, time.Time) error {
+	return nil
+}
+
+func (l *loopRepo) FailTask(context.Context, domain.UpdateTask, string) error { return nil }
+
+func (l *loopRepo) ReleaseTask(context.Context, domain.UpdateTask) error { return nil }
+
+// runInBackground starts the loop and returns a function that stops it and
+// waits for it to finish, so no test leaves a goroutine writing to a log a
+// later test reads.
+func runInBackground(t *testing.T, w *Worker) func() {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+
+	go func() { done <- w.Run(ctx) }()
+
+	return func() {
+		cancel()
+
+		select {
+		case err := <-done:
+			require.NoError(t, err, "a shutdown was reported as a failure")
+		case <-time.After(5 * time.Second):
+			t.Fatal("the worker did not stop with its context")
+		}
+	}
+}
+
+// TestWorkerRunReportsAnUnreachableQueueOnce covers the rule that keeps an
+// outage from burying itself. Every worker polls, so four of them at a one
+// second interval write four lines a second for as long as the database is
+// away -- and the incident is then somewhere inside its own symptom.
+//
+// The first failure is reported and the rest are counted. What is checked here
+// is that silence: the repeat a minute later is left to the clock, and no test
+// waits a minute to see it.
+func TestWorkerRunReportsAnUnreachableQueueOnce(t *testing.T) {
+	logger, records := captureLogger()
+
+	repo := &loopRepo{
+		onClaim: func(int) (domain.UpdateTask, bool, error) {
+			return domain.UpdateTask{}, false, errors.New("connection refused")
+		},
+	}
+
+	stop := runInBackground(t, New(repo, &stubProvider{}, nil, testSettings(time.Second), logger))
+
+	// Enough polls that a line per poll would be unmistakable.
+	require.Eventually(t, func() bool { return repo.claims() >= 20 }, 5*time.Second, time.Millisecond)
+
+	stop()
+
+	reported := entriesWith(records(), "claim task")
+
+	require.Len(t, reported, 1, "the queue was reported on every poll")
+	require.Equal(t, slog.LevelError, reported[0].level())
+	require.Equal(t, 1, reported[0].FailedPolls)
+}
+
+// TestWorkerRunReportsTheRecovery covers the other end of the same rule. The
+// count is what says how long the outage went on, and it is the only figure
+// that does: the single line at the start of it cannot know.
+func TestWorkerRunReportsTheRecovery(t *testing.T) {
+	logger, records := captureLogger()
+
+	const failures = 5
+
+	repo := &loopRepo{
+		onClaim: func(call int) (domain.UpdateTask, bool, error) {
+			if call <= failures {
+				return domain.UpdateTask{}, false, errors.New("connection refused")
+			}
+
+			return domain.UpdateTask{}, false, nil
+		},
+	}
+
+	stop := runInBackground(t, New(repo, &stubProvider{}, nil, testSettings(time.Second), logger))
+
+	require.Eventually(t, func() bool {
+		return len(entriesWith(records(), "claim recovered")) == 1
+	}, 5*time.Second, time.Millisecond)
+
+	stop()
+
+	recovered := requireEntry(t, records(), "claim recovered")
+
+	require.Equal(t, slog.LevelInfo, recovered.level())
+	require.Equal(t, failures, recovered.FailedPolls, "the recovery did not report what was lost")
+}
+
+// TestWorkerRunWakesOnASignal covers what makes the service feel immediate. A
+// posted task signals the pool, and an idle worker claims it at once instead of
+// waiting out the poll interval.
+//
+// The interval here is longer than the test is willing to wait, so a claim
+// arriving at all is the assertion: polling cannot be what produced it.
+func TestWorkerRunWakesOnASignal(t *testing.T) {
+	wake := make(chan struct{}, 1)
+
+	repo := &loopRepo{
+		onClaim: func(int) (domain.UpdateTask, bool, error) {
+			return domain.UpdateTask{}, false, nil
+		},
+	}
+
+	settings := Settings{TaskTimeout: time.Second, PollInterval: time.Hour, ProviderAttempts: 3}
+
+	stop := runInBackground(t, New(repo, &stubProvider{}, wake, settings, discardLogger()))
+	defer stop()
+
+	// The first claim empties the queue and sends the worker to the select.
+	require.Eventually(t, func() bool { return repo.claims() == 1 }, 5*time.Second, time.Millisecond)
+
+	wake <- struct{}{}
+
+	require.Eventually(t, func() bool { return repo.claims() >= 2 },
+		5*time.Second, time.Millisecond, "the signal did not wake an idle worker")
+}
+
+// TestWorkerRunClaimsAgainWithoutWaiting covers the other half of the loop: a
+// worker that found work asks for more straight away, and only an empty queue
+// is worth waiting on. Without it a backlog would drain at one task per
+// interval however many workers were free.
+func TestWorkerRunClaimsAgainWithoutWaiting(t *testing.T) {
+	const queued = 5
+
+	repo := &loopRepo{
+		onClaim: func(call int) (domain.UpdateTask, bool, error) {
+			if call > queued {
+				return domain.UpdateTask{}, false, nil
+			}
+
+			return domain.UpdateTask{
+				ID:       uuid.New(),
+				Pair:     domain.Pair("EUR/MXN"),
+				Status:   domain.StatusInProgress,
+				Attempts: 1,
+			}, true, nil
+		},
+	}
+
+	rates := &stubProvider{rate: provider.Rate{
+		Value: decimal.RequireFromString("19.6552"),
+		Date:  time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC),
+	}}
+
+	// An interval far longer than the test waits: reaching the end of the
+	// queue means the loop never paused between tasks.
+	settings := Settings{TaskTimeout: time.Second, PollInterval: time.Hour, ProviderAttempts: 3}
+
+	stop := runInBackground(t, New(repo, rates, nil, settings, discardLogger()))
+	defer stop()
+
+	require.Eventually(t, func() bool { return repo.claims() > queued },
+		5*time.Second, time.Millisecond, "the loop waited between tasks")
+}
