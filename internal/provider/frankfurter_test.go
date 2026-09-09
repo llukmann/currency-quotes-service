@@ -255,6 +255,13 @@ func TestClientFetchRateContextCancelledMidBody(t *testing.T) {
 
 	go func() {
 		<-reached
+
+		// The handler has flushed its headers, but the client may not have
+		// finished parsing them yet, and cancelling in that instant would end
+		// the request rather than the read. The pause is not what makes the
+		// assertion hold -- both paths answer the same way, which is the point
+		// -- it is what keeps the test on the path it was written for.
+		time.Sleep(50 * time.Millisecond)
 		cancel()
 	}()
 
