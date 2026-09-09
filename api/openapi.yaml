@@ -478,25 +478,31 @@ components:
         - error
       properties:
         error:
-          type: object
-          required:
-            - code
-            - message
-          properties:
-            code:
-              type: string
-              description: |
-                A stable, machine-readable identifier of what went wrong. A
-                client branches on this; the set is closed.
-              enum:
-                - invalid_pair
-                - invalid_request
-                - not_found
-                - key_conflict
-                - internal_error
-            message:
-              type: string
-              description: |
-                The same failure written for a person. Not part of the
-                contract: the wording may change where the code does not.
-              example: 'invalid currency pair: unsupported currency "RUB"'
+          $ref: "#/components/schemas/ErrorBody"
+
+    ErrorBody:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+          description: |
+            The same failure written for a person. Not part of the contract:
+            the wording may change where the code does not.
+          example: 'invalid currency pair: unsupported currency "RUB"'
+
+    ErrorCode:
+      type: string
+      description: |
+        A stable, machine-readable identifier of what went wrong. A client
+        branches on this; the set is closed.
+      enum:
+        - invalid_pair
+        - invalid_request
+        - not_found
+        - key_conflict
+        - internal_error

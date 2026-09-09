@@ -17,14 +17,19 @@ import (
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 
+	"github.com/llukmann/currency-quotes-service/internal/api/contract"
 	"github.com/llukmann/currency-quotes-service/internal/domain"
 )
 
-// creation is one call of CreateTask. The pair is recorded as the string it
-// crossed as: the handler is not allowed to parse one, so what the service
-// receives has to be what the client wrote.
+// headerIdempotencyKey names one intent of one client. The spec declares it;
+// this is the only place left in the package that has to spell it.
+const headerIdempotencyKey = "Idempotency-Key"
+
+// creation is one call of CreateTask. The pair is recorded as it reached the
+// service: parsing happens at the boundary, so what arrives here is already
+// normalised and cannot be anything else.
 type creation struct {
-	pair string
+	pair domain.Pair
 	key  *uuid.UUID
 }
 
@@ -47,10 +52,10 @@ type fakeService struct {
 
 	created []creation
 	fetched []uuid.UUID
-	looked  []string
+	looked  []domain.Pair
 }
 
-func (f *fakeService) CreateTask(ctx context.Context, pair string, key *uuid.UUID) (domain.UpdateTask, error) {
+func (f *fakeService) CreateTask(ctx context.Context, pair domain.Pair, key *uuid.UUID) (domain.UpdateTask, error) {
 	f.created = append(f.created, creation{pair: pair, key: key})
 
 	if f.before != nil {
@@ -78,7 +83,7 @@ func (f *fakeService) GetTask(ctx context.Context, id uuid.UUID) (domain.TaskDet
 	return f.details, nil
 }
 
-func (f *fakeService) GetLatestQuote(ctx context.Context, pair string) (domain.Quote, error) {
+func (f *fakeService) GetLatestQuote(ctx context.Context, pair domain.Pair) (domain.Quote, error) {
 	f.looked = append(f.looked, pair)
 
 	if f.before != nil {
@@ -109,13 +114,13 @@ func serve(t *testing.T, svc quoteService, r *http.Request) *httptest.ResponseRe
 
 // requireEnvelope checks a response against the single error shape of the API:
 // a client branches on the code, so the code is what a test pins.
-func requireEnvelope(t *testing.T, w *httptest.ResponseRecorder, status int, code string) {
+func requireEnvelope(t *testing.T, w *httptest.ResponseRecorder, status int, code contract.ErrorCode) {
 	t.Helper()
 
 	require.Equal(t, status, w.Code)
 	require.Equal(t, contentTypeJSON, w.Header().Get("Content-Type"))
 
-	var got errorResponse
+	var got contract.Error
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
 	require.Equal(t, code, got.Error.Code)
 	require.NotEmpty(t, got.Error.Message)
@@ -146,7 +151,7 @@ func TestCreateTaskAccepted(t *testing.T) {
 		header string
 		status domain.Status
 
-		wantPair string
+		wantPair domain.Pair
 		wantKey  *uuid.UUID
 	}{
 		{
@@ -156,12 +161,12 @@ func TestCreateTaskAccepted(t *testing.T) {
 			wantPair: "EUR/MXN",
 		},
 		{
-			// The pair crosses as written: parsing it is the service's, so
-			// that the whitelist has one caller rather than one per endpoint.
-			name:     "the pair reaches the service unparsed",
+			// Case is not part of a pair, and the service is handed the pair
+			// the domain made of it rather than the one the client typed.
+			name:     "a lower case pair reaches the service parsed",
 			body:     `{"pair":"eur/mxn"}`,
 			status:   domain.StatusPending,
-			wantPair: "eur/mxn",
+			wantPair: "EUR/MXN",
 		},
 		{
 			name:     "a key is parsed and handed on",
@@ -235,26 +240,26 @@ func TestCreateTaskRefused(t *testing.T) {
 		createErr error
 
 		wantStatus int
-		wantCode   string
+		wantCode   contract.ErrorCode
 		wantCalled bool
 	}{
 		{
 			name:       "a body that is not JSON",
 			body:       `not json`,
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidRequest,
+			wantCode:   contract.ErrorCodeInvalidRequest,
 		},
 		{
 			name:       "a truncated body",
 			body:       `{"pair":`,
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidRequest,
+			wantCode:   contract.ErrorCodeInvalidRequest,
 		},
 		{
 			name:       "an empty body",
 			body:       ``,
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidRequest,
+			wantCode:   contract.ErrorCodeInvalidRequest,
 		},
 		{
 			// Refused by the reader rather than buffered: the only body this
@@ -262,25 +267,24 @@ func TestCreateTaskRefused(t *testing.T) {
 			name:       "a body over the size limit",
 			body:       `{"pair":"` + strings.Repeat("E", maxRequestBody) + `"}`,
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidRequest,
+			wantCode:   contract.ErrorCodeInvalidRequest,
 		},
 		{
-			// Held to the contract rather than taken as an opaque string,
-			// which is what bounds the size of something a client controls
-			// before it reaches a column.
+			// Held to the contract by the generated binder, which is what
+			// bounds the size of something a client controls before it
+			// reaches a column.
 			name:       "a key that is not a UUID",
 			body:       `{"pair":"EUR/MXN"}`,
 			header:     "not-a-uuid",
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidRequest,
+			wantCode:   contract.ErrorCodeInvalidRequest,
 		},
 		{
+			// Refused at the boundary, so the service never hears about it.
 			name:       "an unsupported pair",
 			body:       `{"pair":"EUR/RUB"}`,
-			createErr:  domain.ErrInvalidPair,
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidPair,
-			wantCalled: true,
+			wantCode:   contract.ErrorCodeInvalidPair,
 		},
 		{
 			// A missing field arrives as an empty string and is refused by the
@@ -288,10 +292,8 @@ func TestCreateTaskRefused(t *testing.T) {
 			// pair this service can quote.
 			name:       "a body with no pair in it",
 			body:       `{}`,
-			createErr:  domain.ErrInvalidPair,
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidPair,
-			wantCalled: true,
+			wantCode:   contract.ErrorCodeInvalidPair,
 		},
 		{
 			name:       "a key already spent on another pair",
@@ -299,7 +301,7 @@ func TestCreateTaskRefused(t *testing.T) {
 			header:     uuid.NewString(),
 			createErr:  domain.ErrKeyConflict,
 			wantStatus: http.StatusConflict,
-			wantCode:   codeKeyConflict,
+			wantCode:   contract.ErrorCodeKeyConflict,
 			wantCalled: true,
 		},
 		{
@@ -307,7 +309,7 @@ func TestCreateTaskRefused(t *testing.T) {
 			body:       `{"pair":"EUR/MXN"}`,
 			createErr:  errors.New("connection refused"),
 			wantStatus: http.StatusInternalServerError,
-			wantCode:   codeInternalError,
+			wantCode:   contract.ErrorCodeInternalError,
 			wantCalled: true,
 		},
 	}
@@ -338,7 +340,7 @@ func TestCreateTaskHidesTheCause(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`))
 	w := serve(t, svc, r)
 
-	requireEnvelope(t, w, http.StatusInternalServerError, codeInternalError)
+	requireEnvelope(t, w, http.StatusInternalServerError, contract.ErrorCodeInternalError)
 
 	body := w.Body.String()
 	require.NotContains(t, body, "10.0.0.7")
@@ -454,21 +456,21 @@ func TestGetTaskRefused(t *testing.T) {
 		getErr error
 
 		wantStatus int
-		wantCode   string
+		wantCode   contract.ErrorCode
 		wantCalled bool
 	}{
 		{
 			name:       "an identifier that is not a UUID",
 			id:         "not-a-uuid",
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidRequest,
+			wantCode:   contract.ErrorCodeInvalidRequest,
 		},
 		{
 			name:       "a well formed identifier naming no task",
 			id:         uuid.NewString(),
 			getErr:     domain.ErrNotFound,
 			wantStatus: http.StatusNotFound,
-			wantCode:   codeNotFound,
+			wantCode:   contract.ErrorCodeNotFound,
 			wantCalled: true,
 		},
 		{
@@ -476,7 +478,7 @@ func TestGetTaskRefused(t *testing.T) {
 			id:         uuid.NewString(),
 			getErr:     errors.New("connection refused"),
 			wantStatus: http.StatusInternalServerError,
-			wantCode:   codeInternalError,
+			wantCode:   contract.ErrorCodeInternalError,
 			wantCalled: true,
 		},
 	}
@@ -516,24 +518,21 @@ func TestGetLatestQuote(t *testing.T) {
 		"fetched_at": "2026-09-09T10:30:15Z",
 		"update_id": "6f1a2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d"
 	}`, w.Body.String())
-	require.Equal(t, []string{"EUR/MXN"}, svc.looked)
+	require.Equal(t, []domain.Pair{"EUR/MXN"}, svc.looked)
 }
 
 // TestGetLatestQuoteReadsTheParameter checks what arrives at the service. A
 // percent-encoded separator is what a correct client sends, and Query unescapes
-// it for us, so both spellings have to reach the service as the same string.
+// it for us, so both spellings have to reach the service as the same pair.
 func TestGetLatestQuoteReadsTheParameter(t *testing.T) {
 	tests := []struct {
 		name  string
 		query string
-		want  string
+		want  domain.Pair
 	}{
 		{name: "a bare separator", query: "?pair=EUR/MXN", want: "EUR/MXN"},
 		{name: "an encoded separator", query: "?pair=EUR%2FMXN", want: "EUR/MXN"},
-		{name: "a lower case pair crosses unparsed", query: "?pair=eur/mxn", want: "eur/mxn"},
-		// The service refuses it as an invalid pair, by the same rule as an
-		// unsupported one.
-		{name: "a missing parameter is an empty pair", query: "", want: ""},
+		{name: "a lower case pair is upper cased by the domain", query: "?pair=eur/mxn", want: "EUR/MXN"},
 	}
 
 	for _, tt := range tests {
@@ -542,7 +541,7 @@ func TestGetLatestQuoteReadsTheParameter(t *testing.T) {
 
 			serve(t, svc, httptest.NewRequest(http.MethodGet, "/quotes/latest"+tt.query, nil))
 
-			require.Equal(t, []string{tt.want}, svc.looked)
+			require.Equal(t, []domain.Pair{tt.want}, svc.looked)
 		})
 	}
 }
@@ -553,28 +552,44 @@ func TestGetLatestQuoteReadsTheParameter(t *testing.T) {
 func TestGetLatestQuoteRefused(t *testing.T) {
 	tests := []struct {
 		name     string
+		query    string
 		quoteErr error
 
 		wantStatus int
-		wantCode   string
+		wantCode   contract.ErrorCode
+		wantCalled bool
 	}{
 		{
+			// Turned away at the boundary: the service is never asked about a
+			// pair this service cannot quote.
 			name:       "an unsupported pair",
-			quoteErr:   domain.ErrInvalidPair,
+			query:      "?pair=EUR/RUB",
 			wantStatus: http.StatusBadRequest,
-			wantCode:   codeInvalidPair,
+			wantCode:   contract.ErrorCodeInvalidPair,
+		},
+		{
+			// Refused by the generated binder before any handler runs, and
+			// answered as a pair that cannot be parsed: missing, malformed and
+			// unsupported are one answer here.
+			name:       "no pair at all",
+			wantStatus: http.StatusBadRequest,
+			wantCode:   contract.ErrorCodeInvalidPair,
 		},
 		{
 			name:       "a supported pair nobody has quoted",
+			query:      "?pair=EUR/MXN",
 			quoteErr:   domain.ErrNotFound,
 			wantStatus: http.StatusNotFound,
-			wantCode:   codeNotFound,
+			wantCode:   contract.ErrorCodeNotFound,
+			wantCalled: true,
 		},
 		{
 			name:       "a failure of ours",
+			query:      "?pair=EUR/MXN",
 			quoteErr:   errors.New("connection refused"),
 			wantStatus: http.StatusInternalServerError,
-			wantCode:   codeInternalError,
+			wantCode:   contract.ErrorCodeInternalError,
+			wantCalled: true,
 		},
 	}
 
@@ -582,9 +597,10 @@ func TestGetLatestQuoteRefused(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := &fakeService{quoteErr: tt.quoteErr}
 
-			w := serve(t, svc, httptest.NewRequest(http.MethodGet, "/quotes/latest?pair=EUR/MXN", nil))
+			w := serve(t, svc, httptest.NewRequest(http.MethodGet, "/quotes/latest"+tt.query, nil))
 
 			requireEnvelope(t, w, tt.wantStatus, tt.wantCode)
+			require.Len(t, svc.looked, boolToInt(tt.wantCalled))
 		})
 	}
 }
@@ -598,7 +614,7 @@ func TestRouterRecoversFromAPanic(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`))
 	w := serve(t, svc, r)
 
-	requireEnvelope(t, w, http.StatusInternalServerError, codeInternalError)
+	requireEnvelope(t, w, http.StatusInternalServerError, contract.ErrorCodeInternalError)
 }
 
 // TestRouterAppliesTheRequestDeadline checks that a handler cannot outlive its
@@ -618,9 +634,9 @@ func TestRouterAppliesTheRequestDeadline(t *testing.T) {
 
 	NewRouter(svc, discardLogger(), time.Millisecond).ServeHTTP(w, r)
 
-	// Served as internal_error and not as a bare 504: api.md lists no 504 for
+	// Served as internal_error and not as a bare 504: the spec lists no 504 for
 	// any endpoint, and a deadline of ours is a failure of ours.
-	requireEnvelope(t, w, http.StatusInternalServerError, codeInternalError)
+	requireEnvelope(t, w, http.StatusInternalServerError, contract.ErrorCodeInternalError)
 }
 
 // TestRouterAnswersNothingToAClientThatLeft checks the one failure that is not
@@ -714,7 +730,7 @@ func TestCreateTaskReadsNoMoreThanTheLimit(t *testing.T) {
 	svc := &fakeService{}
 	w := serve(t, svc, httptest.NewRequest(http.MethodPost, "/quotes/updates", body))
 
-	requireEnvelope(t, w, http.StatusBadRequest, codeInvalidRequest)
+	requireEnvelope(t, w, http.StatusBadRequest, contract.ErrorCodeInvalidRequest)
 	require.Empty(t, svc.created)
 	require.LessOrEqual(t, body.read, maxRequestBody+1,
 		"the whole body was read before it was refused")
@@ -833,7 +849,7 @@ func TestLogRecordsTheCauseOfAFailure(t *testing.T) {
 
 	NewRouter(svc, logger, 5*time.Second).ServeHTTP(w, r)
 
-	requireEnvelope(t, w, http.StatusInternalServerError, codeInternalError)
+	requireEnvelope(t, w, http.StatusInternalServerError, contract.ErrorCodeInternalError)
 	require.NotContains(t, w.Body.String(), cause)
 
 	entry := requireEntry(t, records(), "request failed")
@@ -1110,4 +1126,97 @@ func TestRecoverPanicLeavesAnAnsweredRequestAlone(t *testing.T) {
 
 	// Reported all the same: the client cannot be told, but the log can.
 	requireEntry(t, records(), "panic in handler")
+}
+
+// requirePairRefusal checks a 400 that names a pair as the reason and returns
+// the message it carried.
+func requirePairRefusal(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	var got contract.Error
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	require.Equal(t, contract.ErrorCodeInvalidPair, got.Error.Code)
+
+	return got.Error.Message
+}
+
+// TestPairRefusalCarriesTheDomainSentence pins what a client is told about a
+// pair this service cannot quote. The sentence naming the currency at fault is
+// written by ParsePair to be read from outside, and it reaches the client
+// unchanged: a wrapper added on the way out would put the name of an internal
+// operation into an answer meant for a person.
+//
+// Compared against what ParsePair itself returns rather than against a literal:
+// the wording is the domain's to change, and what this test is about is that
+// nothing was added to it on the way through.
+func TestPairRefusalCarriesTheDomainSentence(t *testing.T) {
+	t.Run("posting an update", func(t *testing.T) {
+		_, want := domain.ParsePair("EUR/RUB")
+		require.Error(t, want)
+
+		svc := &fakeService{}
+		body := strings.NewReader(`{"pair":"EUR/RUB"}`)
+
+		w := serve(t, svc, httptest.NewRequest(http.MethodPost, "/quotes/updates", body))
+
+		require.Equal(t, want.Error(), requirePairRefusal(t, w))
+		require.Empty(t, svc.created)
+	})
+
+	t.Run("reading the latest quote", func(t *testing.T) {
+		_, want := domain.ParsePair("EUR/RUB")
+		require.Error(t, want)
+
+		svc := &fakeService{}
+
+		w := serve(t, svc, httptest.NewRequest(http.MethodGet, "/quotes/latest?pair=EUR/RUB", nil))
+
+		require.Equal(t, want.Error(), requirePairRefusal(t, w))
+		require.Empty(t, svc.looked)
+	})
+
+	// The parameter never reaches a handler: the generated binder turns the
+	// request away and writeParamError answers it. What it answers with has to
+	// be the same sentence an empty pair would have produced anywhere else.
+	t.Run("reading the latest quote without a pair", func(t *testing.T) {
+		_, want := domain.ParsePair("")
+		require.Error(t, want)
+
+		svc := &fakeService{}
+
+		w := serve(t, svc, httptest.NewRequest(http.MethodGet, "/quotes/latest", nil))
+
+		require.Equal(t, want.Error(), requirePairRefusal(t, w))
+		require.Empty(t, svc.looked)
+	})
+}
+
+// TestGetLatestQuoteNormalisesTheInstant pins the two halves of what the spec
+// says about fetched_at, neither of which the generated type gives on its own:
+// the driver hands back a timestamptz in the zone of the session, and a
+// time.Time marshals in its own zone and with whatever precision it carries.
+func TestGetLatestQuoteNormalisesTheInstant(t *testing.T) {
+	mexicoCity := time.FixedZone("CST", -6*60*60)
+
+	svc := &fakeService{quote: domain.Quote{
+		UpdateID:  uuid.MustParse("6f1a2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d"),
+		Pair:      domain.Pair("EUR/MXN"),
+		Rate:      decimal.RequireFromString("19.6552"),
+		RateDate:  time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC),
+		FetchedAt: time.Date(2026, 9, 9, 4, 30, 15, 123456789, mexicoCity),
+	}}
+
+	w := serve(t, svc, httptest.NewRequest(http.MethodGet, "/quotes/latest?pair=EUR/MXN", nil))
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.JSONEq(t, `{
+		"pair": "EUR/MXN",
+		"rate": "19.6552000000",
+		"rate_date": "2026-09-07",
+		"fetched_at": "2026-09-09T10:30:15Z",
+		"update_id": "6f1a2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d"
+	}`, w.Body.String())
 }

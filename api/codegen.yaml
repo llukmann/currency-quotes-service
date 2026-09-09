@@ -1,0 +1,8 @@
+# Generator settings for internal/api/contract, driven by //go:generate in that
+# package. The spec is the source of truth for the three business endpoints:
+# a route, a parameter or a field renamed here stops the transport compiling.
+package: contract
+output: contract.gen.go
+generate:
+  models: true
+  chi-server: true
