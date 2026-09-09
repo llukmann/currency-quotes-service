@@ -1,10 +1,14 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,7 +55,20 @@ type stubRepo struct {
 	claims    int
 	completed []completion
 	failed    []failure
-	released  []domain.UpdateTask
+	released  []release
+}
+
+// release is one call of ReleaseTask together with the state of the context it
+// arrived on, read while the call was in progress.
+//
+// Read rather than kept: the context is cancelled by a deferred call the moment
+// release returns, so a test asking afterwards would find every one of them
+// done and learn nothing.
+type release struct {
+	claim       domain.UpdateTask
+	ctxErr      error
+	deadline    time.Time
+	hasDeadline bool
 }
 
 func (s *stubRepo) ClaimTask(context.Context) (domain.UpdateTask, bool, error) {
@@ -90,8 +107,15 @@ func (s *stubRepo) FailTask(_ context.Context, claim domain.UpdateTask, reason s
 	return s.failErr
 }
 
-func (s *stubRepo) ReleaseTask(_ context.Context, claim domain.UpdateTask) error {
-	s.released = append(s.released, claim)
+func (s *stubRepo) ReleaseTask(ctx context.Context, claim domain.UpdateTask) error {
+	deadline, hasDeadline := ctx.Deadline()
+
+	s.released = append(s.released, release{
+		claim:       claim,
+		ctxErr:      ctx.Err(),
+		deadline:    deadline,
+		hasDeadline: hasDeadline,
+	})
 
 	return s.releaseErr
 }
@@ -255,7 +279,7 @@ func TestWorkerClaimAndProcess(t *testing.T) {
 			}
 
 			for _, got := range repo.released {
-				require.Equal(t, claim, got)
+				require.Equal(t, claim, got.claim)
 			}
 
 			if tt.wantCompleted > 0 {
@@ -312,4 +336,294 @@ func TestWorkerRunStopsWithTheContext(t *testing.T) {
 	cancel()
 
 	require.NoError(t, New(repo, &stubProvider{}, nil, testSettings(time.Second), discardLogger()).Run(ctx))
+}
+
+// logEntry is one structured record, decoded from what the logger wrote. Only
+// the fields the tests below ask about.
+type logEntry struct {
+	Level       string `json:"level"`
+	Msg         string `json:"msg"`
+	Error       string `json:"error"`
+	Reason      string `json:"reason"`
+	Count       int    `json:"count"`
+	FailedPolls int    `json:"failed_polls"`
+	UpdateID    string `json:"update_id"`
+}
+
+func (e logEntry) level() slog.Level {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(e.Level)); err != nil {
+		return slog.LevelInfo
+	}
+
+	return level
+}
+
+// captureLogger returns a logger writing structured records and a function
+// reading back what it has written. It is safe to read while the loops below
+// are still running, which is why the buffer is behind a lock.
+func captureLogger() (*slog.Logger, func() []logEntry) {
+	buf := &lockedBuffer{}
+
+	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	return logger, func() []logEntry {
+		var entries []logEntry
+
+		for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			if line == "" {
+				continue
+			}
+
+			var entry logEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				continue
+			}
+
+			entries = append(entries, entry)
+		}
+
+		return entries
+	}
+}
+
+// lockedBuffer lets a test read the log of a loop that is still writing it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// entriesWith returns every record carrying this message.
+func entriesWith(entries []logEntry, msg string) []logEntry {
+	var found []logEntry
+
+	for _, entry := range entries {
+		if entry.Msg == msg {
+			found = append(found, entry)
+		}
+	}
+
+	return found
+}
+
+// requireEntry finds the one record with this message and fails the test when
+// there is none.
+func requireEntry(t *testing.T, entries []logEntry, msg string) logEntry {
+	t.Helper()
+
+	found := entriesWith(entries, msg)
+	require.Lenf(t, found, 1, "expected exactly one %q record among %d written", msg, len(entries))
+
+	return found[0]
+}
+
+// TestWorkerReleaseOutlivesTheCancellationThatCausedIt covers the one context
+// in this package that must not be the caller's.
+//
+// A claim is handed back precisely because the task's context is done -- the
+// service is shutting down -- so a statement issued on that context would fail
+// before it was sent, in the single case the whole path exists for. The task
+// would then stay in progress until the recovery pass noticed, which is the
+// delay releasing it is there to avoid.
+func TestWorkerReleaseOutlivesTheCancellationThatCausedIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	claim := domain.UpdateTask{
+		ID:       uuid.New(),
+		Pair:     domain.Pair("EUR/MXN"),
+		Status:   domain.StatusInProgress,
+		Attempts: 1,
+	}
+
+	repo := &stubRepo{task: claim, hasTask: true}
+	rates := &stubProvider{before: func(context.Context) { cancel() }, err: context.Canceled}
+
+	claimed, err := New(repo, rates, nil, testSettings(5*time.Second), discardLogger()).claimAndProcess(ctx)
+
+	require.NoError(t, err)
+	require.True(t, claimed)
+	require.Len(t, repo.released, 1)
+
+	released := repo.released[0]
+
+	require.NoError(t, released.ctxErr, "the release was issued on a context that was already done")
+
+	// Bounded all the same: this runs during a shutdown, and a statement with
+	// no deadline would hold it open for as long as the database stayed quiet.
+	require.True(t, released.hasDeadline, "the release was issued without a deadline")
+	require.False(t, released.deadline.After(time.Now().Add(releaseTimeout)))
+}
+
+// TestWorkerLogsTheRawProviderFailure covers the boundary this package is here
+// to hold. The client is told a normalised sentence that names the outcome and
+// not the mechanism, which is only acceptable because the upstream's own words,
+// its URL and its status are written down somewhere -- and this is the one line
+// that ever sees them.
+//
+// Remove it and nothing outside changes: the task fails with the same reason,
+// the same status, the same answer to the client. Only the ability to find out
+// why goes.
+func TestWorkerLogsTheRawProviderFailure(t *testing.T) {
+	const raw = "fetch rate EUR/MXN: upstream status 503: {\"message\":\"service unavailable\"}"
+
+	logger, records := captureLogger()
+
+	claim := domain.UpdateTask{
+		ID:       uuid.New(),
+		Pair:     domain.Pair("EUR/MXN"),
+		Status:   domain.StatusInProgress,
+		Attempts: 1,
+	}
+
+	repo := &stubRepo{task: claim, hasTask: true}
+	rates := &stubProvider{err: fmt.Errorf("%s: %w", raw, provider.ErrTransient)}
+
+	_, err := New(repo, rates, nil, testSettings(5*time.Second), logger).claimAndProcess(t.Context())
+	require.NoError(t, err)
+
+	entry := requireEntry(t, records(), "fetch rate")
+
+	require.Equal(t, slog.LevelError, entry.level())
+	require.Contains(t, entry.Error, raw)
+	require.Equal(t, "provider unavailable after 3 attempts", entry.Reason)
+	require.Equal(t, claim.ID.String(), entry.UpdateID)
+
+	// What was stored is the normalised sentence alone: the two must not be the
+	// same string, or the boundary is not being held.
+	require.Len(t, repo.failed, 1)
+	require.Equal(t, "provider unavailable after 3 attempts", repo.failed[0].reason)
+	require.NotContains(t, repo.failed[0].reason, "503")
+}
+
+// TestWorkerFinalisationFailures covers what happens when the statement that
+// was supposed to close a task does not go through. None of these can be
+// reported to a client -- the request that queued the task was answered long
+// ago -- so the log is the whole of the outcome.
+func TestWorkerFinalisationFailures(t *testing.T) {
+	unreachable := errors.New("connection refused")
+
+	tests := []struct {
+		name string
+		// fetchErr decides which finalising statement is reached.
+		fetchErr    error
+		completeErr error
+		failErr     error
+		releaseErr  error
+
+		wantMsg   string
+		wantLevel slog.Level
+	}{
+		{
+			// The task belongs to somebody else now, and what this worker was
+			// about to record about it is void.
+			name:        "a lost claim ends it",
+			completeErr: fmt.Errorf("complete task: %w", domain.ErrStaleClaim),
+			wantMsg:     "claim lost, result discarded",
+			wantLevel:   slog.LevelWarn,
+		},
+		{
+			name:        "a completion that did not go through is reported",
+			completeErr: unreachable,
+			wantMsg:     "complete task",
+			wantLevel:   slog.LevelError,
+		},
+		{
+			// The provider failed and so did the statement recording that.
+			name:      "a failure that could not be stored is reported",
+			fetchErr:  errors.New("upstream status 404"),
+			failErr:   unreachable,
+			wantMsg:   "fail task",
+			wantLevel: slog.LevelError,
+		},
+		{
+			name:      "a failure whose claim was lost ends it",
+			fetchErr:  errors.New("upstream status 404"),
+			failErr:   fmt.Errorf("fail task: %w", domain.ErrStaleClaim),
+			wantMsg:   "claim lost, result discarded",
+			wantLevel: slog.LevelWarn,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, records := captureLogger()
+
+			claim := domain.UpdateTask{
+				ID:       uuid.New(),
+				Pair:     domain.Pair("EUR/MXN"),
+				Status:   domain.StatusInProgress,
+				Attempts: 1,
+			}
+
+			repo := &stubRepo{
+				task:        claim,
+				hasTask:     true,
+				completeErr: tt.completeErr,
+				failErr:     tt.failErr,
+				releaseErr:  tt.releaseErr,
+			}
+
+			rates := &stubProvider{
+				rate: provider.Rate{
+					Value: decimal.RequireFromString("19.6552"),
+					Date:  time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC),
+				},
+				err: tt.fetchErr,
+			}
+
+			_, err := New(repo, rates, nil, testSettings(5*time.Second), logger).claimAndProcess(t.Context())
+			require.NoError(t, err)
+
+			entry := requireEntry(t, records(), tt.wantMsg)
+			require.Equal(t, tt.wantLevel, entry.level())
+			require.Equal(t, claim.ID.String(), entry.UpdateID)
+
+			// Nothing was handed back: the context is live, so this is not a
+			// shutdown and the task stays where the failed statement left it.
+			require.Empty(t, repo.released)
+		})
+	}
+}
+
+// TestWorkerReleaseFailureIsNotFatal covers the last thing that can go wrong
+// on the way out. The shutdown is not held up for it: the task simply stays in
+// progress, which is the state the recovery pass exists for.
+func TestWorkerReleaseFailureIsNotFatal(t *testing.T) {
+	logger, records := captureLogger()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	claim := domain.UpdateTask{
+		ID:       uuid.New(),
+		Pair:     domain.Pair("EUR/MXN"),
+		Status:   domain.StatusInProgress,
+		Attempts: 1,
+	}
+
+	repo := &stubRepo{task: claim, hasTask: true, releaseErr: errors.New("connection refused")}
+	rates := &stubProvider{before: func(context.Context) { cancel() }, err: context.Canceled}
+
+	claimed, err := New(repo, rates, nil, testSettings(5*time.Second), logger).claimAndProcess(ctx)
+
+	require.NoError(t, err)
+	require.True(t, claimed)
+
+	entry := requireEntry(t, records(), "task left in progress")
+	require.Equal(t, slog.LevelWarn, entry.level())
 }
