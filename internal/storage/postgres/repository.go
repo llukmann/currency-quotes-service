@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 
@@ -24,6 +23,10 @@ import (
 // updated_at = now(), and nothing in the schema enforces that.
 type Repository struct {
 	pool *pgxpool.Pool
+	// keyTTL is how long a binding between an idempotency key and its task
+	// holds. Nothing deletes an expired one: the lookup stops seeing it and the
+	// next post carrying that key takes the row over.
+	keyTTL time.Duration
 }
 
 // pingTimeout bounds the one call this package makes before the service is
@@ -39,8 +42,11 @@ const pingTimeout = 10 * time.Second
 // it a host that cannot be reached at all would first be reported as a failed
 // request, long after the start it should have stopped.
 //
+// keyTTL is how long an idempotency key stays bound to the task it was answered
+// with.
+//
 // The caller closes the repository, which closes the pool.
-func New(ctx context.Context, databaseURL string) (*Repository, error) {
+func New(ctx context.Context, databaseURL string, keyTTL time.Duration) (*Repository, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect to database: %w", err)
@@ -55,7 +61,7 @@ func New(ctx context.Context, databaseURL string) (*Repository, error) {
 		return nil, fmt.Errorf("connect to database: %w", err)
 	}
 
-	return &Repository{pool: pool}, nil
+	return &Repository{pool: pool, keyTTL: keyTTL}, nil
 }
 
 // Close releases the pool and waits for the connections in use to be returned.
@@ -63,27 +69,10 @@ func (r *Repository) Close() {
 	r.pool.Close()
 }
 
-// uniqueViolation is the SQLSTATE Postgres reports for a duplicate key.
-//
-// Spelled out rather than taken from jackc/pgerrcode, which does sit in the
-// module graph already -- but only because the migration driver happens to use
-// it. Importing it here would turn a by-product of somebody else's choice into
-// a requirement of ours, and the code it names has been fixed by the standard
-// for longer than either library has existed.
-const uniqueViolation = "23505"
-
 // querier is the part of pgx that does not care whether it is addressing the
 // pool or a transaction, so that one statement can be issued from either.
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
-
-// isUniqueViolation reports a duplicate key raised by Postgres, however the
-// driver wrapped it on the way up.
-func isUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-
-	return errors.As(err, &pgErr) && pgErr.Code == uniqueViolation
 }
 
 // CreateTask queues a refresh of pair and returns the task that answers the
@@ -127,7 +116,19 @@ func (r *Repository) CreateTask(ctx context.Context, pair domain.Pair, key *uuid
 
 // createTaskWithKey writes the task and the binding to it as one unit.
 func (r *Repository) createTaskWithKey(ctx context.Context, pair domain.Pair, key uuid.UUID) (domain.UpdateTask, error) {
-	const bindQuery = `INSERT INTO idempotency_keys (key, update_id) VALUES ($1, $2)`
+	// Three outcomes in one statement. No row for this key: it is bound here.
+	// A row past its lifetime: it is taken over, which is the only thing that
+	// ever ends a binding now that nothing deletes one. A row that still holds:
+	// the condition on the update fails, no row comes back, and that is how a
+	// key already spoken for is reported -- an insert that raised a duplicate
+	// key instead would be indistinguishable from one that hit an expired row.
+	const bindQuery = `
+		INSERT INTO idempotency_keys (key, update_id)
+		VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE
+		   SET update_id = EXCLUDED.update_id, created_at = now()
+		 WHERE idempotency_keys.created_at <= now() - make_interval(secs => $3)
+		RETURNING key`
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -142,30 +143,35 @@ func (r *Repository) createTaskWithKey(ctx context.Context, pair domain.Pair, ke
 		return domain.UpdateTask{}, err
 	}
 
-	if _, err := tx.Exec(ctx, bindQuery, key, task.ID); err != nil {
-		if !isUniqueViolation(err) {
-			return domain.UpdateTask{}, fmt.Errorf("create task: bind key: %w", err)
+	var bound uuid.UUID
+
+	err = tx.QueryRow(ctx, bindQuery, key, task.ID, r.keyTTL.Seconds()).Scan(&bound)
+
+	switch {
+	case err == nil:
+		if err := tx.Commit(ctx); err != nil {
+			return domain.UpdateTask{}, fmt.Errorf("create task: commit: %w", err)
 		}
 
-		// Somebody bound this key first. Rolling back drops the task written a
-		// moment ago along with it, which is the whole reason both are here.
+		return task, nil
+
+	case errors.Is(err, pgx.ErrNoRows):
+		// Somebody holds this key. Rolling back drops the task written a moment
+		// ago along with it, which is the whole reason both are here.
 		//
-		// The winner has committed by now, and that is not an assumption: an
-		// insert conflicting with an uncommitted duplicate waits for the other
-		// transaction to end, so arriving at this line means it ended by
+		// The holder has committed by now, and that is not an assumption: a
+		// statement conflicting with an uncommitted duplicate waits for the
+		// other transaction to end, so arriving here means it ended by
 		// committing rather than by rolling back.
 		if err := tx.Rollback(ctx); err != nil {
 			return domain.UpdateTask{}, fmt.Errorf("create task: rollback: %w", err)
 		}
 
 		return r.replayByKey(ctx, key, pair)
-	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return domain.UpdateTask{}, fmt.Errorf("create task: commit: %w", err)
+	default:
+		return domain.UpdateTask{}, fmt.Errorf("create task: bind key: %w", err)
 	}
-
-	return task, nil
 }
 
 // replayByKey answers a post whose key turned out to be bound already.
@@ -175,11 +181,12 @@ func (r *Repository) replayByKey(ctx context.Context, key uuid.UUID, pair domain
 		return domain.UpdateTask{}, err
 	}
 	if !found {
-		// Only reachable if the sweep removed the binding between the conflict
-		// and this read, which needs it to have been past its lifetime already
-		// when it was written. Reported rather than retried around: it would
-		// mean the sweep and the insert disagree about what exists.
-		return domain.UpdateTask{}, fmt.Errorf("create task: key %s conflicted but holds no binding", key)
+		// The two statements read the clock at two instants, so a binding that
+		// held when the insert refused it can be expired by the time of this
+		// read. Reported rather than retried around: the window is the width of
+		// one round trip at the far end of a lifetime measured in hours, and a
+		// retry loop here would be machinery for a case nobody will meet.
+		return domain.UpdateTask{}, fmt.Errorf("create task: key %s is held but binds no task", key)
 	}
 
 	return replayTask(task, pair)
@@ -201,18 +208,21 @@ func replayTask(task domain.UpdateTask, pair domain.Pair) (domain.UpdateTask, er
 // status served beside the identifier has to be the one the task carries now,
 // not the one it was created in.
 //
-// Age is deliberately not part of the condition. The sweep is the only thing
-// that ends a binding, so a row that is here is a binding that holds -- and a
-// predicate here would disagree with the insert, which collides with rows the
-// sweep has not reached yet.
+// Age is part of the condition, and this is where the lifetime of a binding is
+// enforced: nothing deletes an expired row, the lookup simply stops seeing it.
+// Measured by the database clock, as every other age in this file, so that the
+// cutoff is weighed against the timestamps it is compared with rather than
+// against this container's idea of now.
 func (r *Repository) taskByKey(ctx context.Context, key uuid.UUID) (domain.UpdateTask, bool, error) {
 	const query = `
 		SELECT u.id, u.pair, u.status, u.attempts, COALESCE(u.error, ''), u.created_at, u.updated_at
 		  FROM idempotency_keys k
 		  JOIN quote_updates u ON u.id = k.update_id
-		 WHERE k.key = $1`
+		 WHERE k.key = $1
+		   AND k.created_at > now() - make_interval(secs => $2)`
 
-	task, err := scanTask(r.pool.QueryRow(ctx, query, key))
+	task, err := scanTask(r.pool.QueryRow(ctx, query, key, r.keyTTL.Seconds()))
+
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.UpdateTask{}, false, nil
 	}
@@ -590,29 +600,6 @@ func (r *Repository) ReleaseStuckTasks(
 	}
 
 	return int(releaseTag.RowsAffected()), int(abandonTag.RowsAffected()), nil
-}
-
-// DeleteExpiredKeys removes idempotency bindings older than olderThan and
-// reports how many went.
-//
-// This is the only thing that ends a binding, which is what makes the presence
-// of a row the whole of the question a lookup asks. It follows that the sweep
-// running late stretches a lifetime rather than breaking one, and that it can
-// fail or be cut short without the contract moving.
-func (r *Repository) DeleteExpiredKeys(ctx context.Context, olderThan time.Duration) (int, error) {
-	// A sequential scan by design: created_at carries no index, which would
-	// cost on every insert -- the hot path of a post -- to hurry a sweep nobody
-	// is waiting on. Age is measured by the database clock as everywhere else,
-	// since a cutoff computed here would weigh the database's timestamps
-	// against this container's.
-	const query = `DELETE FROM idempotency_keys WHERE created_at < now() - make_interval(secs => $1)`
-
-	tag, err := r.pool.Exec(ctx, query, olderThan.Seconds())
-	if err != nil {
-		return 0, fmt.Errorf("delete expired keys: %w", err)
-	}
-
-	return int(tag.RowsAffected()), nil
 }
 
 // scanTask reads the columns of quote_updates in the order the queries above

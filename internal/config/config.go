@@ -30,8 +30,7 @@ const (
 	defaultWorkerRecoveryInterval = 30 * time.Second
 	defaultWorkerMaxAttempts      = 3
 
-	defaultIdempotencyTTL             = time.Hour
-	defaultIdempotencyCleanupInterval = 10 * time.Minute
+	defaultIdempotencyTTL = time.Hour
 )
 
 // Valid TCP port range. Port 0 is excluded: it would make the server pick an
@@ -103,11 +102,6 @@ type Config struct {
 	// the day such keys are conventionally kept: a client repeating a live key
 	// is handed the earlier task rather than a fresh rate.
 	IdempotencyTTL time.Duration
-	// IdempotencyCleanupInterval is how often expired bindings are swept. The
-	// sweep is the only thing enforcing the lifetime above -- a lookup never
-	// checks the age of what it finds -- so this interval is the margin by
-	// which a binding outlives it.
-	IdempotencyCleanupInterval time.Duration
 }
 
 // Load reads the configuration from the environment. Unset variables fall
@@ -171,23 +165,20 @@ func Load() (Config, error) {
 	if cfg.IdempotencyTTL, err = durationFromEnv("IDEMPOTENCY_TTL", defaultIdempotencyTTL); err != nil {
 		return Config{}, err
 	}
-	if cfg.IdempotencyCleanupInterval, err = durationFromEnv("IDEMPOTENCY_CLEANUP_INTERVAL", defaultIdempotencyCleanupInterval); err != nil {
+
+	if err := cfg.check(); err != nil {
 		return Config{}, err
 	}
 
 	return cfg, nil
 }
 
-// CheckTimeouts rejects a combination of settings that cannot hold together, so
-// that the service refuses to start rather than misbehave later: a write
-// timeout with no room for a handler deadline under it would leave requests
-// unbounded, a staleness threshold too close to the task deadline would have
-// the recovery pass take tasks away from workers that are still working on
-// them, and a sweep of idempotency keys rarer than the lifetime it is there to
-// enforce would quietly multiply it.
-//
-// Load does not call this -- main does, once, right after it.
-func (c Config) CheckTimeouts() error {
+// check rejects a combination of settings that cannot hold together, so that
+// the service refuses to start rather than misbehave later: a write timeout
+// with no room for a handler deadline under it would leave requests unbounded,
+// and a staleness threshold too close to the task deadline would have the
+// recovery pass take tasks away from workers that are still working on them.
+func (c Config) check() error {
 	if c.HTTPWriteTimeout <= handlerTimeoutMargin {
 		return fmt.Errorf(
 			"HTTP_WRITE_TIMEOUT: %s leaves nothing above the %s reserved for writing the answer",
@@ -199,16 +190,6 @@ func (c Config) CheckTimeouts() error {
 		return fmt.Errorf(
 			"WORKER_STUCK_TIMEOUT: %s is less than %s, which is %d times WORKER_TASK_TIMEOUT",
 			c.WorkerStuckTimeout, minStuck, stuckTimeoutMargin,
-		)
-	}
-
-	// A sweep rarer than the lifetime it enforces would not shorten a binding,
-	// it would stretch it: nothing else expires one, so the interval is the
-	// error bar on the whole setting, and it is only meaningful below it.
-	if c.IdempotencyCleanupInterval >= c.IdempotencyTTL {
-		return fmt.Errorf(
-			"IDEMPOTENCY_CLEANUP_INTERVAL: %s is not shorter than the IDEMPOTENCY_TTL of %s it enforces",
-			c.IdempotencyCleanupInterval, c.IdempotencyTTL,
 		)
 	}
 

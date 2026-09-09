@@ -1,7 +1,6 @@
 package config
 
 import (
-	"cmp"
 	"log/slog"
 	"os"
 	"regexp"
@@ -13,10 +12,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestConfigCheckTimeouts pins the three invariants the service refuses to
-// start without. They are worth a test of their own now that Load no longer
-// runs them: the check is one call in main away from being forgotten, and it is
-// cheap to state here what it must reject. The numbers are the configured
+// TestConfigCheckTimeouts pins the two invariants the service refuses to start
+// without. Load runs them, so a case here states what has to be rejected
+// without having to reach for the environment. The numbers are the configured
 // defaults, so a change to them shows up as a failure with a name on it.
 func TestConfigCheckTimeouts(t *testing.T) {
 	tests := []struct {
@@ -24,12 +22,6 @@ func TestConfigCheckTimeouts(t *testing.T) {
 		writeTimeout time.Duration
 		taskTimeout  time.Duration
 		stuckTimeout time.Duration
-		// The sweep of idempotency keys and the lifetime it enforces. Left at
-		// zero by every case that is about one of the other three rules, which
-		// the fixture then fills with a valid pair: a case states the rule it
-		// is about and stays silent on the rest.
-		cleanupInterval time.Duration
-		idempotencyTTL  time.Duration
 		// wantErr is the variable the failure has to name; empty means the
 		// combination must be accepted.
 		wantErr string
@@ -68,25 +60,6 @@ func TestConfigCheckTimeouts(t *testing.T) {
 			taskTimeout:  15 * time.Second,
 			stuckTimeout: 30 * time.Second,
 		},
-		{
-			// Equal is already wrong: the sweep is the only thing that ends a
-			// binding, so an interval that matches the lifetime doubles it.
-			name:            "a sweep as rare as the lifetime it enforces is refused",
-			writeTimeout:    10 * time.Second,
-			taskTimeout:     15 * time.Second,
-			stuckTimeout:    time.Minute,
-			cleanupInterval: time.Hour,
-			idempotencyTTL:  time.Hour,
-			wantErr:         "IDEMPOTENCY_CLEANUP_INTERVAL",
-		},
-		{
-			name:            "the configured sweep and lifetime hold",
-			writeTimeout:    10 * time.Second,
-			taskTimeout:     15 * time.Second,
-			stuckTimeout:    time.Minute,
-			cleanupInterval: defaultIdempotencyCleanupInterval,
-			idempotencyTTL:  defaultIdempotencyTTL,
-		},
 	}
 
 	for _, tt := range tests {
@@ -95,13 +68,9 @@ func TestConfigCheckTimeouts(t *testing.T) {
 				HTTPWriteTimeout:   tt.writeTimeout,
 				WorkerTaskTimeout:  tt.taskTimeout,
 				WorkerStuckTimeout: tt.stuckTimeout,
-				// A valid pair stands in wherever a case did not care, so that
-				// the rule under test is the only one that can fail it.
-				IdempotencyCleanupInterval: cmp.Or(tt.cleanupInterval, time.Minute),
-				IdempotencyTTL:             cmp.Or(tt.idempotencyTTL, time.Hour),
 			}
 
-			err := cfg.CheckTimeouts()
+			err := cfg.check()
 
 			if tt.wantErr == "" {
 				require.NoError(t, err)
@@ -221,11 +190,9 @@ func TestLoadDefaults(t *testing.T) {
 	require.Equal(t, defaultWorkerMaxAttempts, cfg.WorkerMaxAttempts)
 
 	require.Equal(t, defaultIdempotencyTTL, cfg.IdempotencyTTL)
-	require.Equal(t, defaultIdempotencyCleanupInterval, cfg.IdempotencyCleanupInterval)
 
-	// The defaults have to survive the checks the service starts with, or an
-	// empty environment is one the service refuses to run in.
-	require.NoError(t, cfg.CheckTimeouts())
+	// Load itself runs the checks, so reaching this point with no error is
+	// already the assertion that the defaults hold together.
 }
 
 // TestLoadReadsEveryVariableIntoItsOwnField is what eighteen near-identical
@@ -247,15 +214,17 @@ func TestLoadReadsEveryVariableIntoItsOwnField(t *testing.T) {
 		"PROVIDER_ATTEMPTS": "15",
 		"PROVIDER_BACKOFF":  "16s",
 
-		"WORKER_CONCURRENCY":       "17",
-		"WORKER_POLL_INTERVAL":     "18s",
-		"WORKER_TASK_TIMEOUT":      "19s",
-		"WORKER_STUCK_TIMEOUT":     "20s",
+		"WORKER_CONCURRENCY":   "17",
+		"WORKER_POLL_INTERVAL": "18s",
+		"WORKER_TASK_TIMEOUT":  "19s",
+		// Out of the ascending sequence the rest of this map follows: Load now
+		// runs the checks, and the staleness threshold has to be at least twice
+		// the task deadline above. Still a value no other variable here holds.
+		"WORKER_STUCK_TIMEOUT":     "40s",
 		"WORKER_RECOVERY_INTERVAL": "21s",
 		"WORKER_MAX_ATTEMPTS":      "22",
 
-		"IDEMPOTENCY_TTL":              "23s",
-		"IDEMPOTENCY_CLEANUP_INTERVAL": "24s",
+		"IDEMPOTENCY_TTL": "23s",
 	})
 	require.NoError(t, err)
 
@@ -275,12 +244,11 @@ func TestLoadReadsEveryVariableIntoItsOwnField(t *testing.T) {
 		WorkerConcurrency:      17,
 		WorkerPollInterval:     18 * time.Second,
 		WorkerTaskTimeout:      19 * time.Second,
-		WorkerStuckTimeout:     20 * time.Second,
+		WorkerStuckTimeout:     40 * time.Second,
 		WorkerRecoveryInterval: 21 * time.Second,
 		WorkerMaxAttempts:      22,
 
-		IdempotencyTTL:             23 * time.Second,
-		IdempotencyCleanupInterval: 24 * time.Second,
+		IdempotencyTTL: 23 * time.Second,
 	}, cfg)
 }
 
@@ -360,7 +328,6 @@ func TestLoadRejectsBadValues(t *testing.T) {
 		{name: "a staleness threshold of zero", key: "WORKER_STUCK_TIMEOUT", value: "0"},
 		{name: "a recovery interval spelled out", key: "WORKER_RECOVERY_INTERVAL", value: "half a minute"},
 		{name: "a key lifetime with a space in it", key: "IDEMPOTENCY_TTL", value: "1 hour"},
-		{name: "a sweep interval of zero", key: "IDEMPOTENCY_CLEANUP_INTERVAL", value: "0s"},
 
 		{name: "a count that is not a number", key: "PROVIDER_ATTEMPTS", value: "three"},
 		{name: "no attempts at all", key: "PROVIDER_ATTEMPTS", value: "0"},

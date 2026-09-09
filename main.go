@@ -36,10 +36,6 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	if err := cfg.CheckTimeouts(); err != nil {
-		return fmt.Errorf("check config: %w", err)
-	}
-
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
 
@@ -53,7 +49,7 @@ func run() error {
 	// happens after the group below has been waited on -- a pool closed while
 	// a worker still holds a connection would fail the very finalisation the
 	// shutdown is waiting for.
-	repo, err := postgres.New(ctx, cfg.DatabaseURL)
+	repo, err := postgres.New(ctx, cfg.DatabaseURL, cfg.IdempotencyTTL)
 	if err != nil {
 		return err
 	}
@@ -85,11 +81,6 @@ func run() error {
 		Interval:     cfg.WorkerRecoveryInterval,
 		StuckTimeout: cfg.WorkerStuckTimeout,
 		MaxAttempts:  cfg.WorkerMaxAttempts,
-	}, logger)
-
-	cleanup := worker.NewCleanup(repo, worker.CleanupSettings{
-		Interval: cfg.IdempotencyCleanupInterval,
-		TTL:      cfg.IdempotencyTTL,
 	}, logger)
 
 	srv := &http.Server{
@@ -127,8 +118,6 @@ func run() error {
 	}
 
 	g.Go(func() error { return recovery.Run(ctx) })
-
-	g.Go(func() error { return cleanup.Run(ctx) })
 
 	g.Go(func() error {
 		<-ctx.Done()

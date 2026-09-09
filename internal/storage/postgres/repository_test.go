@@ -30,6 +30,11 @@ import (
 // numeric to decimal.Decimal.
 const testDatabaseURL = "TEST_DATABASE_URL"
 
+// testKeyTTL is the lifetime the repository under test binds keys for. Long
+// enough that nothing expires by the clock during a run: the tests that are
+// about expiry move a row's timestamp instead of waiting for one.
+const testKeyTTL = time.Hour
+
 // pool is shared by every test in the package, since connecting per test would
 // dominate the runtime. The tests do not run in parallel and each starts from
 // an empty schema.
@@ -117,7 +122,7 @@ func newRepo(t *testing.T) *Repository {
 	_, err := pool.Exec(t.Context(), `TRUNCATE quotes, idempotency_keys, quote_updates`)
 	require.NoError(t, err)
 
-	return &Repository{pool: pool}
+	return &Repository{pool: pool, keyTTL: testKeyTTL}
 }
 
 // createTask queues a refresh and fails the test if it could not be queued.
@@ -139,6 +144,21 @@ func claimTask(t *testing.T, r *Repository) domain.UpdateTask {
 	require.True(t, ok, "the queue was empty")
 
 	return task
+}
+
+// finish drives a task to done, so that a test about idempotency keys can put
+// one out of the way of the partial index on unfinished work.
+func finish(t *testing.T, r *Repository, task domain.UpdateTask) {
+	t.Helper()
+
+	claim := claimTask(t, r)
+	require.Equal(t, task.ID, claim.ID)
+
+	err := r.CompleteTask(
+		t.Context(), claim,
+		decimal.RequireFromString("19.6552"), today(), time.Now().UTC(),
+	)
+	require.NoError(t, err)
 }
 
 // countRows answers how much of a table survived, which is how the tests about
@@ -1083,49 +1103,74 @@ func TestReleaseStuckTasksEmptyReason(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestDeleteExpiredKeys covers the only thing that ends a binding, which is
-// what makes the presence of a row the whole of the question a lookup asks.
-func TestDeleteExpiredKeys(t *testing.T) {
-	repo := newRepo(t)
-
-	const ttl = time.Hour
-
-	fresh, expired := uuid.New(), uuid.New()
-
-	task := createTask(t, repo, "EUR/MXN", &fresh)
-	createTask(t, repo, "EUR/MXN", &expired)
-	require.Equal(t, 2, countRows(t, "idempotency_keys"))
-
-	age(t, "idempotency_keys", "created_at", expired, 2*ttl)
-
-	deleted, err := repo.DeleteExpiredKeys(t.Context(), ttl)
-
-	require.NoError(t, err)
-	require.Equal(t, 1, deleted)
-	require.Equal(t, 1, countRows(t, "idempotency_keys"))
-
-	// The task outlives its binding: the sweep removes the receipt, never the
-	// work it was written for.
-	require.Equal(t, domain.StatusPending, taskByID(t, task.ID).Status)
-
-	// The expired key is a stranger again, while the fresh one still answers.
-	replayed := createTask(t, repo, "EUR/MXN", &fresh)
-	require.Equal(t, task.ID, replayed.ID)
-}
-
-// TestDeleteExpiredKeysNothingToDo checks the ordinary case: the sweep runs on
-// a schedule and most passes find nothing.
-func TestDeleteExpiredKeysNothingToDo(t *testing.T) {
+// TestExpiredKeyIsTakenOver covers the whole of what ends a binding now that
+// nothing deletes one: the lookup stops seeing the row, and the post that finds
+// it expired writes its own task over it.
+func TestExpiredKeyIsTakenOver(t *testing.T) {
 	repo := newRepo(t)
 
 	key := uuid.New()
-	createTask(t, repo, "EUR/MXN", &key)
 
-	deleted, err := repo.DeleteExpiredKeys(t.Context(), time.Hour)
-
-	require.NoError(t, err)
-	require.Zero(t, deleted)
+	first := createTask(t, repo, "EUR/MXN", &key)
 	require.Equal(t, 1, countRows(t, "idempotency_keys"))
+
+	// The task has to leave the queue as well, or the partial index would
+	// answer the second post with the same task whatever the key did.
+	finish(t, repo, first)
+
+	age(t, "idempotency_keys", "created_at", key, 2*testKeyTTL)
+
+	second := createTask(t, repo, "EUR/MXN", &key)
+
+	// A new task, bound to the same key, in the same row: taking a binding over
+	// is an update, not a second receipt.
+	require.NotEqual(t, first.ID, second.ID)
+	require.Equal(t, 1, countRows(t, "idempotency_keys"))
+
+	// And the key answers for the new task from here on.
+	replayed := createTask(t, repo, "EUR/MXN", &key)
+	require.Equal(t, second.ID, replayed.ID)
+}
+
+// TestExpiredKeyIsTakenOverAcrossPairs checks the other half of a takeover: an
+// expired binding holds nothing back, so the key is free to name a different
+// pair than the one it was spent on.
+func TestExpiredKeyIsTakenOverAcrossPairs(t *testing.T) {
+	repo := newRepo(t)
+
+	key := uuid.New()
+
+	first := createTask(t, repo, "EUR/MXN", &key)
+	finish(t, repo, first)
+
+	// While it holds, the same key on another pair is a conflict.
+	_, err := repo.CreateTask(t.Context(), domain.Pair("USD/MXN"), &key)
+	require.ErrorIs(t, err, domain.ErrKeyConflict)
+
+	age(t, "idempotency_keys", "created_at", key, 2*testKeyTTL)
+
+	second, err := repo.CreateTask(t.Context(), domain.Pair("USD/MXN"), &key)
+	require.NoError(t, err)
+	require.Equal(t, domain.Pair("USD/MXN"), second.Pair)
+	require.Equal(t, 1, countRows(t, "idempotency_keys"))
+}
+
+// TestLiveKeyIsNotTakenOver is the case the condition on the takeover exists
+// for: a binding within its lifetime answers with the task it holds, and no row
+// is written.
+func TestLiveKeyIsNotTakenOver(t *testing.T) {
+	repo := newRepo(t)
+
+	key := uuid.New()
+
+	first := createTask(t, repo, "EUR/MXN", &key)
+	finish(t, repo, first)
+
+	second := createTask(t, repo, "EUR/MXN", &key)
+
+	require.Equal(t, first.ID, second.ID)
+	require.Equal(t, 1, countRows(t, "idempotency_keys"))
+	require.Equal(t, 1, countRows(t, "quote_updates"))
 }
 
 // taskByID reads a task straight from the table, so that a test checks what was
@@ -1259,14 +1304,6 @@ func TestRepositoryReportsAFailingDatabaseAsItself(t *testing.T) {
 				return err
 			},
 		},
-		{
-			name: "deleting expired keys",
-			call: func(ctx context.Context) error {
-				_, err := repo.DeleteExpiredKeys(ctx, time.Hour)
-
-				return err
-			},
-		},
 	}
 
 	for _, tt := range tests {
@@ -1312,16 +1349,14 @@ func TestCompleteTaskRollsBackARefusedQuote(t *testing.T) {
 	require.Zero(t, countRows(t, "quotes"))
 }
 
-// TestReplayByKeyWithoutABinding covers the branch the code calls unreachable.
-// It is reached only if the sweep removed a binding between the conflict that
-// found it and the read that follows, which needs the binding to have been past
-// its lifetime already when it was written.
+// TestReplayByKeyWithoutABinding covers the branch that needs the two statements
+// to read the clock at two instants: a binding that still held when the insert
+// refused it, and was expired by the time of the read that follows.
 //
-// Called directly rather than raced into, since what is worth pinning is not
-// how to get there but what happens: it is reported, because it would mean the
-// sweep and the insert disagree about what exists. Answered as a conflict it
-// would tell a client its key belonged to another pair, and answered as success
-// it would hand back an empty task.
+// Called directly rather than raced into, since what is worth pinning is not how
+// to get there but what happens: it is reported. Answered as a conflict it would
+// tell a client its key belonged to another pair, and answered as success it
+// would hand back an empty task.
 func TestReplayByKeyWithoutABinding(t *testing.T) {
 	repo := newRepo(t)
 
