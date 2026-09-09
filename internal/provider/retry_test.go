@@ -234,6 +234,17 @@ func TestBackoffSchedule(t *testing.T) {
 			backoff:  0,
 			want:     []time.Duration{0, 0},
 		},
+		{
+			// Unreachable through the two callers, which normalise first, and
+			// asked here directly because the guard is what stands between a
+			// count of zero and make() with a negative capacity. Called rather
+			// than reasoned about: that is the difference between a contract
+			// and a comment.
+			name:     "a count below one is raised to one here too",
+			attempts: 0,
+			backoff:  100 * time.Millisecond,
+			want:     []time.Duration{},
+		},
 	}
 
 	for _, tt := range tests {
