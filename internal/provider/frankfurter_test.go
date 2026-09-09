@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,9 +43,10 @@ func TestClientFetchRate(t *testing.T) {
 		// wantRate is the decimal the call must return; empty means the call
 		// must fail instead.
 		wantRate string
-		// wantTransient says whether the failure is one worth repeating. It is
-		// asserted for successes and failures alike, so a permanent error that
-		// started wrapping ErrTransient would be caught here.
+		// wantTransient says whether the failure is one worth repeating, and is
+		// checked on every case that fails. It is what the retrier branches on,
+		// so a permanent error that started wrapping ErrTransient would be
+		// caught here -- and so would a transient one that stopped.
 		wantTransient bool
 	}{
 		{
@@ -186,6 +188,210 @@ func TestClientFetchRate(t *testing.T) {
 			require.Equal(t, wantDate, rate.Date)
 		})
 	}
+}
+
+// TestClientFetchRateBodyCutShort covers the upstream that promises a body and
+// then goes away half way through it. The answer never becomes a status the
+// client can classify, so the failure has to be marked transient here, in the
+// read -- an upstream that died mid-sentence is exactly the kind another
+// attempt may not meet.
+//
+// Not the same case as the truncated body in the table above: that one is a
+// complete HTTP response carrying JSON that does not parse, and it fails a
+// dozen lines later with an answer of its own.
+func TestClientFetchRateBodyCutShort(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Written straight onto the connection: net/http would otherwise
+		// correct the length to what was actually sent, which is the one thing
+		// this test needs to be wrong.
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			return
+		}
+
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n{\"rates\":"))
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL, time.Minute).FetchRate(t.Context(), mustParsePair(t, "EUR/MXN"))
+
+	require.ErrorIs(t, err, ErrTransient)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+}
+
+// TestClientFetchRateContextCancelledMidBody is the other half of the rule
+// TestClientFetchRateContextCancelled covers. A cancellation can land after the
+// headers have arrived as easily as before them, and the read has to tell the
+// two apart the same way the request does: the caller leaving is not the
+// upstream failing, and marked transient it would buy a backoff nobody is
+// waiting out.
+func TestClientFetchRateContextCancelledMidBody(t *testing.T) {
+	reached := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A body promised and begun, so the client is inside the read rather
+		// than still waiting for a status.
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"rates":`)
+
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+
+		close(reached)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func() {
+		<-reached
+
+		// The handler has flushed its headers, but the client may not have
+		// finished parsing them yet, and cancelling in that instant would end
+		// the request rather than the read. The pause is not what makes the
+		// assertion hold -- both paths answer the same way, which is the point
+		// -- it is what keeps the test on the path it was written for.
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := NewClient(srv.URL, time.Minute).FetchRate(ctx, mustParsePair(t, "EUR/MXN"))
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrTransient)
+}
+
+// TestClientFetchRateReadsNoMoreThanTheCap checks the bound on what an upstream
+// can make this process hold. A rate answer is a few hundred bytes; anything
+// past the cap is not one, and reading it whole would let a misbehaving
+// upstream exhaust the worker that asked.
+//
+// The body below is a valid answer with the rate placed beyond the cap, so the
+// truncation is what the assertion rests on: read whole it would parse, and
+// read to the cap it cannot. The failure is permanent -- asking again returns
+// the same oversized body.
+//
+// The padding is sized from the constant rather than written out, so this
+// checks that a cap is enforced and not what it is set to. The number itself is
+// a tuning decision with nothing downstream depending on it; that the read
+// stops somewhere is the invariant.
+func TestClientFetchRateReadsNoMoreThanTheCap(t *testing.T) {
+	padding := strings.Repeat("x", maxBodySize)
+	body := `{"padding":"` + padding + `","date":"2026-09-07","rates":{"MXN":19.6552}}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL, time.Minute).FetchRate(t.Context(), mustParsePair(t, "EUR/MXN"))
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrTransient)
+	require.Greater(t, len(body), maxBodySize, "the body has to be larger than the cap for this to prove anything")
+}
+
+// TestClientFetchRateQuotesOnlyASnippetOfTheBody checks the other half of that
+// bound. The error below is written on every failed attempt of every task, and
+// the body it describes is capped at 64 KB -- which is 64 KB per line in the
+// log unless it is cut here.
+func TestClientFetchRateQuotesOnlyASnippetOfTheBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", maxBodySize))
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL, time.Minute).FetchRate(t.Context(), mustParsePair(t, "EUR/MXN"))
+
+	require.ErrorIs(t, err, ErrTransient)
+	// The message carries the pair, the status and a snippet; what it must not
+	// carry is the body.
+	require.Less(t, len(err.Error()), snippetSize*2)
+}
+
+// TestSnippet pins where the cut falls. The boundary is the whole of what this
+// function decides, and an off-by-one either way is invisible in the messages
+// it appears in.
+func TestSnippet(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "an empty body",
+			body: "",
+			want: "",
+		},
+		{
+			// Bodies arrive with a trailing newline more often than not, and it
+			// buys nothing in the middle of a log line.
+			name: "surrounding whitespace is dropped",
+			body: "  {\"message\":\"not found\"}\n",
+			want: `{"message":"not found"}`,
+		},
+		{
+			name: "a body exactly at the limit is left whole",
+			body: strings.Repeat("x", snippetSize),
+			want: strings.Repeat("x", snippetSize),
+		},
+		{
+			name: "one byte past the limit is cut",
+			body: strings.Repeat("x", snippetSize+1),
+			want: strings.Repeat("x", snippetSize) + "...",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, snippet([]byte(tt.body)))
+		})
+	}
+}
+
+// TestClientFetchRateMalformedBaseURL covers the one failure that happens
+// before anything is sent. The host is configuration, so this is the shape a
+// typo in PROVIDER_BASE_URL takes, and it is deliberately not transient:
+// retrying a URL that cannot be parsed spends the budget on the same answer
+// three times.
+func TestClientFetchRateMalformedBaseURL(t *testing.T) {
+	_, err := NewClient("http://exa mple.com", time.Minute).
+		FetchRate(t.Context(), mustParsePair(t, "EUR/MXN"))
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrTransient)
+}
+
+// TestNewClientTrimsATrailingSlash checks the one thing the constructor does to
+// its argument. A host written with a slash is the likelier spelling of the
+// two, and left alone it would produce a double slash in the path -- which the
+// upstream is under no obligation to treat as the same endpoint.
+func TestNewClientTrimsATrailingSlash(t *testing.T) {
+	var gotPath string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"date":"2026-09-07","rates":{"MXN":19.6552}}`)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL+"/", time.Minute).FetchRate(t.Context(), mustParsePair(t, "EUR/MXN"))
+
+	require.NoError(t, err)
+	require.Equal(t, latestPath, gotPath)
 }
 
 // TestClientFetchRateUnreachableUpstream covers the failure that never reaches

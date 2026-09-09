@@ -87,6 +87,15 @@ func Budget(attempts int, timeout, backoff time.Duration) time.Duration {
 // first: the base, then a doubling of it every time. The pauses actually taken
 // are these spread over their jitter window, and the longest a run can take is
 // what Budget adds up.
+//
+// attempts below one is raised to one here as well as in NewRetrier and
+// Budget, and the repetition is deliberate. Both callers normalise before
+// calling today, so this branch cannot be reached today -- but what it guards
+// is make() with a negative capacity, which panics, and the alternative to two
+// lines here is a claim about two other functions that has to be rechecked
+// every time a third one is added. Normalising rather than rejecting for the
+// same reason NewRetrier gives: a schedule of no pauses is a sound answer to
+// a single attempt.
 func backoffSchedule(attempts int, backoff time.Duration) []time.Duration {
 	if attempts < 1 {
 		attempts = 1
