@@ -87,11 +87,11 @@ func Budget(attempts int, timeout, backoff time.Duration) time.Duration {
 // first: the base, then a doubling of it every time. The pauses actually taken
 // are these spread over their jitter window, and the longest a run can take is
 // what Budget adds up.
+//
+// attempts must be at least one, which both callers see to before calling:
+// Budget raises its own argument and Retrier holds a count NewRetrier raised.
+// A third copy of that guard here would be unreachable.
 func backoffSchedule(attempts int, backoff time.Duration) []time.Duration {
-	if attempts < 1 {
-		attempts = 1
-	}
-
 	schedule := make([]time.Duration, 0, attempts-1)
 
 	delay := backoff

@@ -187,6 +187,62 @@ func TestBudget(t *testing.T) {
 	}
 }
 
+// TestBackoffSchedule pins the shape of the pauses, which Budget only ever
+// checks as a sum: a schedule that stopped doubling, or one that started from
+// the wrong end, would add up differently but a schedule with the same total
+// in a different order would not.
+//
+// What is still covered by inspection alone is the indexing in FetchRate. It
+// walks this list one entry per attempt, and a version taking the first pause
+// every time would pass every test here -- telling the two apart means timing
+// a run against a jitter window wide enough to swallow the difference.
+func TestBackoffSchedule(t *testing.T) {
+	tests := []struct {
+		name     string
+		attempts int
+		backoff  time.Duration
+		want     []time.Duration
+	}{
+		{
+			// One attempt is one request and nothing to wait for.
+			name:     "a single attempt has no pauses at all",
+			attempts: 1,
+			backoff:  100 * time.Millisecond,
+			want:     []time.Duration{},
+		},
+		{
+			name:     "the configured schedule",
+			attempts: 3,
+			backoff:  200 * time.Millisecond,
+			want:     []time.Duration{200 * time.Millisecond, 400 * time.Millisecond},
+		},
+		{
+			name:     "each pause is twice the one before it",
+			attempts: 4,
+			backoff:  100 * time.Millisecond,
+			want: []time.Duration{
+				100 * time.Millisecond,
+				200 * time.Millisecond,
+				400 * time.Millisecond,
+			},
+		},
+		{
+			// Doubling nothing is still nothing: the attempts follow one
+			// another as fast as the upstream answers.
+			name:     "no backoff means pauses of zero, not no pauses",
+			attempts: 3,
+			backoff:  0,
+			want:     []time.Duration{0, 0},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, backoffSchedule(tt.attempts, tt.backoff))
+		})
+	}
+}
+
 // TestJitteredStaysInItsWindow pins the formula rather than the draw. The
 // window is what the spread is for: a factor that could come out at or below
 // zero would collapse the backoff, and one drawn from [0,1) would only ever
