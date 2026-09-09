@@ -64,11 +64,11 @@ func ParsePair(s string) (Pair, error) {
 // from the constructor that makes the assumption true.
 //
 // That guarantee is a convention rather than a rule the compiler enforces: the
-// type is exported, so Pair("EUR") compiles, and this method would answer with
-// two empty strings. The invariant is held the same way quotes.pair is held --
-// by there being exactly one writer -- and it fails the same gentle way: the
-// request goes out with empty currencies and the upstream rejects it, rather
-// than a wrong rate being stored.
+// type is exported, so Pair("EUR") compiles, and this method would hand back
+// the whole of it as the base currency and an empty quote. The invariant is
+// held the same way quotes.pair is held -- by there being exactly one writer --
+// and it fails the same gentle way: the request goes out with a currency
+// missing and the upstream rejects it, rather than a wrong rate being stored.
 func (p Pair) Currencies() (base, quote string) {
 	base, quote, _ = strings.Cut(string(p), "/")
 
