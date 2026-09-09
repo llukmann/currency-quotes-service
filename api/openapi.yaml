@@ -1,0 +1,502 @@
+openapi: 3.0.3
+
+info:
+  title: Currency Quotes Service
+  version: "1.0.0"
+  description: |
+    Asynchronous currency quotes.
+
+    A client never fetches a rate directly. It posts an update, which is queued
+    and answered at once with an identifier, while a background worker performs
+    the refresh; the two GET endpoints read what that worker has stored. There
+    is no synchronous way to obtain a fresh rate.
+
+    The flow is: `POST /quotes/updates` for an identifier, `GET
+    /quotes/updates/{id}` polled until the status leaves `pending` or
+    `in_progress`, and `GET /quotes/latest` for the last known rate of a pair,
+    whichever update produced it.
+
+    Supported currencies are USD, EUR and MXN. A pair is written BASE/QUOTE,
+    and a rate says how many units of the quote currency one unit of the base
+    currency buys: 20.13 for EUR/MXN means 20.13 pesos to the euro.
+
+servers:
+  - url: http://localhost:8080
+    description: Local instance started by docker compose.
+
+security: []
+
+paths:
+  /quotes/updates:
+    post:
+      operationId: createQuoteUpdate
+      summary: Queue a quote update
+      description: |
+        Queues a refresh of one pair and answers with the identifier to poll.
+        This handler never contacts the rate provider, so a 202 says the task
+        was accepted, not that a rate was fetched.
+
+        The task answered with is not always a new one. A post naming a pair
+        that is already waiting or being refreshed is answered with that task,
+        and a post repeating a live `Idempotency-Key` is answered with the task
+        the first one created. The status in the body is therefore the status
+        the row carries now, and it can be any of the four: a client repeating
+        a key may be handed a task that has already finished, or failed.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUpdateRequest"
+      responses:
+        "202":
+          description: |
+            The task is queued. It may have been created by an earlier post,
+            either for the same pair or under the same idempotency key.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptedResponse"
+        "400":
+          description: |
+            The body is not valid JSON, is empty or exceeds 4 KiB
+            (`invalid_request`); the pair is malformed or names a currency
+            outside the supported set (`invalid_pair`); or `Idempotency-Key`
+            was sent but is not a UUID (`invalid_request`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                unsupported_currency:
+                  summary: Currency outside the supported set
+                  value:
+                    error:
+                      code: invalid_pair
+                      message: 'invalid currency pair: unsupported currency "RUB"'
+                malformed_body:
+                  summary: Body that could not be read
+                  value:
+                    error:
+                      code: invalid_request
+                      message: request body is not valid JSON
+                malformed_key:
+                  summary: Idempotency key that is not a UUID
+                  value:
+                    error:
+                      code: invalid_request
+                      message: Idempotency-Key is not a valid UUID
+        "409":
+          description: |
+            The `Idempotency-Key` is already bound to a task for a different
+            pair. The identifier of that task is deliberately not returned: it
+            names an update of a pair this client did not ask for.
+
+            The check lasts as long as the binding does. Once it expires, the
+            same key with another pair silently queues a new task.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: key_conflict
+                  message: idempotency key already used with a different pair
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /quotes/updates/{id}:
+    get:
+      operationId: getQuoteUpdate
+      summary: Read the state of an update
+      description: |
+        Returns what an update has produced so far, reading from the database
+        alone. This is the endpoint a client polls after a post.
+
+        A failed task is answered with 200 rather than an error status: the
+        request itself worked, and what it found is that the background refresh
+        did not. `failed` is terminal, and nothing reopens the task -- trying
+        again means a new post, with a new idempotency key if the client uses
+        them.
+      parameters:
+        - $ref: "#/components/parameters/UpdateIdPath"
+      responses:
+        "200":
+          description: The task exists, in any of its four statuses.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskResponse"
+              examples:
+                queued:
+                  summary: Not refreshed yet
+                  value:
+                    update_id: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                    pair: EUR/MXN
+                    status: pending
+                done:
+                  summary: Refreshed
+                  value:
+                    update_id: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                    pair: EUR/MXN
+                    status: done
+                    rate: "20.1394500000"
+                    rate_date: "2026-09-04"
+                    fetched_at: "2026-09-05T14:32:07Z"
+                failed:
+                  summary: The refresh did not succeed
+                  value:
+                    update_id: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+                    pair: EUR/MXN
+                    status: failed
+                    error: provider unavailable after 3 attempts
+        "400":
+          description: The identifier in the path is not a UUID.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: invalid_request
+                  message: update id is not a valid UUID
+        "404":
+          description: No update carries this identifier.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: not_found
+                  message: no update with this id
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /quotes/latest:
+    get:
+      operationId: getLatestQuote
+      summary: Read the last known rate of a pair
+      description: |
+        Returns the most recent stored rate for a pair, whichever update
+        produced it and however old it is. It reads from the database alone, so
+        a pair nobody has ever posted an update for has no answer here.
+      parameters:
+        - $ref: "#/components/parameters/PairQuery"
+      responses:
+        "200":
+          description: A rate has been stored for this pair.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteResponse"
+        "400":
+          description: |
+            The `pair` parameter is missing, malformed, or names a currency
+            outside the supported set. All three are the same answer: the
+            request named no pair this service can quote.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                missing_pair:
+                  summary: Parameter not sent
+                  value:
+                    error:
+                      code: invalid_pair
+                      message: 'invalid currency pair: "" is not in BASE/QUOTE form'
+                unsupported_currency:
+                  summary: Currency outside the supported set
+                  value:
+                    error:
+                      code: invalid_pair
+                      message: 'invalid currency pair: unsupported currency "RUB"'
+        "404":
+          description: |
+            The pair is supported but has never been quoted. Unlike a 400, this
+            answer changes as soon as an update completes.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: not_found
+                  message: this pair has not been quoted yet
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  headers:
+    RequestId:
+      description: |
+        Identifier of this request, generated by the service and returned on
+        every answer. Quote it when reporting a problem: the log line
+        describing what went wrong carries the same value.
+
+        A value sent with the request is not adopted -- the identifier is
+        always the service's own, so it is a UUID whatever the client sent.
+      schema:
+        type: string
+        format: uuid
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        A UUID naming one intent of one client. Optional: without it a post is
+        still deduplicated against unfinished work on the same pair, but only a
+        key tells a retry of one request apart from a fresh request for the
+        same thing.
+
+        A repeat carrying the same key is answered with the original task and
+        the same 202, whatever became of that task since. A new attempt at a
+        refresh is a new intent and needs a new key.
+
+        The binding between a key and its task lives for a configurable time,
+        an hour by default, and in practice a little longer: a background
+        sweep is what removes it. Once it is gone, the same key queues a new
+        task.
+      schema:
+        type: string
+        format: uuid
+      example: 6f4d1e2a-9c3b-4f7e-8a1d-2b5c7e9f0a13
+
+    UpdateIdPath:
+      name: id
+      in: path
+      required: true
+      description: The identifier returned when the update was queued.
+      schema:
+        $ref: "#/components/schemas/UpdateId"
+
+    PairQuery:
+      name: pair
+      in: query
+      required: true
+      description: |
+        The pair to read. The slash may be sent literally (`?pair=EUR/MXN`) or
+        percent-encoded (`?pair=EUR%2FMXN`).
+      schema:
+        $ref: "#/components/schemas/Pair"
+
+  responses:
+    InternalError:
+      description: |
+        The service failed to answer. What went wrong is written to the log
+        with the request id beside it; the client is told the code alone. That
+        id is the `X-Request-Id` header of this response, which is what makes
+        the log line findable from the outside.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: internal_error
+              message: internal error
+
+  schemas:
+    Pair:
+      type: string
+      description: |
+        A currency pair written BASE/QUOTE. Both currencies have to be USD, EUR
+        or MXN, and they have to differ.
+
+        In a request the case does not matter, so `eur/mxn` names the same pair
+        as `EUR/MXN`. In an answer the pair is always upper case.
+      example: EUR/MXN
+
+    Status:
+      type: string
+      description: |
+        The state of an update. `pending` and `in_progress` both mean the
+        refresh has not finished and are equivalent to a client waiting for it;
+        `done` and `failed` are terminal.
+      enum:
+        - pending
+        - in_progress
+        - done
+        - failed
+      example: pending
+
+    UpdateId:
+      type: string
+      format: uuid
+      description: Identifier of an update, assigned when it is queued.
+      example: 7c9e6679-7425-40de-944b-e07fc1f90ae7
+
+    Rate:
+      type: string
+      description: |
+        How many units of the quote currency one unit of the base currency
+        buys, with the ten decimal places it is stored with.
+
+        Served as a string rather than a JSON number on purpose: most clients
+        parse a JSON number into a float64, and a rate that survives that round
+        trip intact is a coincidence.
+      pattern: '^[0-9]+\.[0-9]{10}$'
+      example: "20.1394500000"
+
+    RateDate:
+      type: string
+      format: date
+      description: |
+        The day the rate is valid for, as the provider states it. Reference
+        rates are daily and published on working days only, so this can lag
+        behind `fetched_at` by several days over a weekend.
+      example: "2026-09-04"
+
+    FetchedAt:
+      type: string
+      format: date-time
+      description: |
+        When this service received the rate, in UTC and to the second. Together
+        with `rate_date` it separates a stale rate from a stale service: over a
+        weekend two updates return the same rate and the same `rate_date`, and
+        only this field says both of them ran.
+      example: "2026-09-05T14:32:07Z"
+
+    CreateUpdateRequest:
+      type: object
+      required:
+        - pair
+      properties:
+        pair:
+          $ref: "#/components/schemas/Pair"
+
+    AcceptedResponse:
+      type: object
+      description: |
+        Two fields and no more. A rate here would invite reading this endpoint
+        as a synchronous quote, which is the one thing the asynchronous
+        contract exists to prevent, and the reason a task failed belongs to
+        `GET /quotes/updates/{id}`, which is the only place that keeps it.
+      required:
+        - update_id
+        - status
+      properties:
+        update_id:
+          $ref: "#/components/schemas/UpdateId"
+        status:
+          $ref: "#/components/schemas/Status"
+
+    TaskResponse:
+      type: object
+      description: |
+        An update and whatever it has produced so far.
+
+        The last four fields depend on the status: a task still queued carries
+        none of them, a completed one carries the rate and its two dates, and a
+        failed one carries the reason it failed.
+      required:
+        - update_id
+        - pair
+        - status
+      properties:
+        update_id:
+          $ref: "#/components/schemas/UpdateId"
+        pair:
+          $ref: "#/components/schemas/Pair"
+        status:
+          $ref: "#/components/schemas/Status"
+        rate:
+          $ref: "#/components/schemas/Rate"
+        rate_date:
+          $ref: "#/components/schemas/RateDate"
+        fetched_at:
+          $ref: "#/components/schemas/FetchedAt"
+        error:
+          type: string
+          description: |
+            Why the refresh failed, present on a failed task alone. Written for
+            a person; a client branching on the outcome reads the status.
+          example: provider unavailable after 3 attempts
+
+    QuoteResponse:
+      type: object
+      description: The last rate stored for a pair, with the update it came from.
+      required:
+        - pair
+        - rate
+        - rate_date
+        - fetched_at
+        - update_id
+      properties:
+        pair:
+          $ref: "#/components/schemas/Pair"
+        rate:
+          $ref: "#/components/schemas/Rate"
+        rate_date:
+          $ref: "#/components/schemas/RateDate"
+        fetched_at:
+          $ref: "#/components/schemas/FetchedAt"
+        update_id:
+          $ref: "#/components/schemas/UpdateId"
+
+    Error:
+      type: object
+      description: |
+        The single error envelope of this API: every failure of every endpoint
+        is shaped like this, so a client parses one thing.
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: |
+                A stable, machine-readable identifier of what went wrong. A
+                client branches on this; the set is closed.
+              enum:
+                - invalid_pair
+                - invalid_request
+                - not_found
+                - key_conflict
+                - internal_error
+            message:
+              type: string
+              description: |
+                The same failure written for a person. Not part of the
+                contract: the wording may change where the code does not.
+              example: 'invalid currency pair: unsupported currency "RUB"'
