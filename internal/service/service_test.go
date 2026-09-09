@@ -41,9 +41,13 @@ type stubRepo struct {
 	created []creation
 	fetched []uuid.UUID
 	looked  []domain.Pair
+	// ctxs holds the context each call arrived with, so a test can ask whether
+	// it is the caller's own rather than one made up on the way down.
+	ctxs []context.Context
 }
 
-func (s *stubRepo) CreateTask(_ context.Context, pair domain.Pair, key *uuid.UUID) (domain.UpdateTask, error) {
+func (s *stubRepo) CreateTask(ctx context.Context, pair domain.Pair, key *uuid.UUID) (domain.UpdateTask, error) {
+	s.ctxs = append(s.ctxs, ctx)
 	s.created = append(s.created, creation{pair: pair, key: key})
 
 	if s.onCreate != nil {
@@ -57,7 +61,8 @@ func (s *stubRepo) CreateTask(_ context.Context, pair domain.Pair, key *uuid.UUI
 	return s.task, nil
 }
 
-func (s *stubRepo) GetTask(_ context.Context, id uuid.UUID) (domain.TaskDetails, error) {
+func (s *stubRepo) GetTask(ctx context.Context, id uuid.UUID) (domain.TaskDetails, error) {
+	s.ctxs = append(s.ctxs, ctx)
 	s.fetched = append(s.fetched, id)
 
 	if s.getErr != nil {
@@ -67,7 +72,8 @@ func (s *stubRepo) GetTask(_ context.Context, id uuid.UUID) (domain.TaskDetails,
 	return s.details, nil
 }
 
-func (s *stubRepo) GetLatestQuote(_ context.Context, pair domain.Pair) (domain.Quote, error) {
+func (s *stubRepo) GetLatestQuote(ctx context.Context, pair domain.Pair) (domain.Quote, error) {
+	s.ctxs = append(s.ctxs, ctx)
 	s.looked = append(s.looked, pair)
 
 	if s.quoteErr != nil {
@@ -402,4 +408,160 @@ func boolToInt(b bool) int {
 	}
 
 	return 0
+}
+
+// callerKey marks a context as the one a test handed in, so that a context
+// made up somewhere below can be told from the one that was passed down.
+type callerKey struct{}
+
+// TestServicePassesTheCallersContext covers the rule the whole request path
+// rests on: the context reaches the driver, so a client that goes away or a
+// deadline that expires stops the work rather than leaving it running against
+// a connection nobody is waiting on.
+//
+// Two things are asked of it, because one is not enough. The value says the
+// context was inherited rather than made -- a context.Background() carries
+// none. The cancellation says what was inherited is still the caller's: a
+// context.WithoutCancel would carry the value across and drop the only part
+// that matters.
+//
+// The linter catches the first of those spellings today, which is worth
+// having and is not the same as a test: it holds for as long as the
+// configuration does, and it recognises the mistake by its shape rather than
+// by its effect.
+func TestServicePassesTheCallersContext(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(ctx context.Context, svc *Service) error
+	}{
+		{
+			name: "creating a task",
+			call: func(ctx context.Context, svc *Service) error {
+				_, err := svc.CreateTask(ctx, "EUR/MXN", nil)
+
+				return err
+			},
+		},
+		{
+			name: "reading a task",
+			call: func(ctx context.Context, svc *Service) error {
+				_, err := svc.GetTask(ctx, uuid.New())
+
+				return err
+			},
+		},
+		{
+			name: "reading the latest quote",
+			call: func(ctx context.Context, svc *Service) error {
+				_, err := svc.GetLatestQuote(ctx, "EUR/MXN")
+
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &stubRepo{
+				task: domain.UpdateTask{ID: uuid.New(), Pair: domain.Pair("EUR/MXN"), Status: domain.StatusPending},
+			}
+
+			ctx, cancel := context.WithCancel(context.WithValue(t.Context(), callerKey{}, "the caller's"))
+			// Cancelled before the call rather than during it: what is being
+			// checked is which context arrived, not what anybody does about it.
+			cancel()
+
+			require.NoError(t, tt.call(ctx, New(repo, make(chan struct{}, 1))))
+
+			require.Len(t, repo.ctxs, 1)
+			got := repo.ctxs[0]
+
+			require.Equal(t, "the caller's", got.Value(callerKey{}), "storage was handed a context of its own")
+			require.ErrorIs(t, got.Err(), context.Canceled, "storage was handed a context that outlives the caller")
+		})
+	}
+}
+
+// TestServiceCreateTaskReturnsTheParseErrorUnchanged pins a decision the
+// handler depends on and cannot see. The sentence ParsePair writes names the
+// currency at fault and is served to the client as the message of an
+// invalid_pair, so wrapping it here would put the name of an internal
+// operation into an answer written to be read from outside.
+//
+// Compared against what ParsePair itself returns rather than against a literal:
+// the wording is the domain's to change, and what this test is about is that
+// nothing was added to it on the way through.
+func TestServiceCreateTaskReturnsTheParseErrorUnchanged(t *testing.T) {
+	const pair = "EUR/RUB"
+
+	_, want := domain.ParsePair(pair)
+	require.Error(t, want)
+
+	repo := &stubRepo{}
+
+	_, err := New(repo, nil).CreateTask(t.Context(), pair, nil)
+
+	require.EqualError(t, err, want.Error())
+	require.Empty(t, repo.created)
+}
+
+// TestServiceGetLatestQuoteReturnsTheParseErrorUnchanged is the same rule on
+// the endpoint that validates the other pair a client can send.
+func TestServiceGetLatestQuoteReturnsTheParseErrorUnchanged(t *testing.T) {
+	const pair = "EUR/RUB"
+
+	_, want := domain.ParsePair(pair)
+	require.Error(t, want)
+
+	repo := &stubRepo{}
+
+	_, err := New(repo, nil).GetLatestQuote(t.Context(), pair)
+
+	require.EqualError(t, err, want.Error())
+	require.Empty(t, repo.looked)
+}
+
+// TestServiceCreateTaskRefusesThePairBeforeTheKey checks the order the two
+// checks happen in. A key is compared against the pair its task was queued
+// for, so the pair has to be the normalised one by then -- and a request
+// naming no pair this service can quote is refused whether it carries a key or
+// not, without the key ever being looked at.
+func TestServiceCreateTaskRefusesThePairBeforeTheKey(t *testing.T) {
+	key := uuid.New()
+
+	repo := &stubRepo{}
+
+	_, err := New(repo, nil).CreateTask(t.Context(), "EUR/RUB", &key)
+
+	require.ErrorIs(t, err, domain.ErrInvalidPair)
+	require.Empty(t, repo.created, "the key reached storage under a pair that was never valid")
+}
+
+// TestServiceGettersPassStorageFailuresUp checks that a database that has
+// stopped answering is reported as itself. The API turns the domain errors into
+// 400 and 404 and everything else into a 500, so an error invented here would
+// be a 500 with a cause nobody wrote down.
+func TestServiceGettersPassStorageFailuresUp(t *testing.T) {
+	unreachable := errors.New("connection refused")
+
+	t.Run("reading a task", func(t *testing.T) {
+		repo := &stubRepo{getErr: unreachable}
+
+		details, err := New(repo, nil).GetTask(t.Context(), uuid.New())
+
+		require.ErrorIs(t, err, unreachable)
+		require.Empty(t, details)
+	})
+
+	t.Run("reading the latest quote", func(t *testing.T) {
+		repo := &stubRepo{quoteErr: unreachable}
+
+		quote, err := New(repo, nil).GetLatestQuote(t.Context(), "EUR/MXN")
+
+		require.ErrorIs(t, err, unreachable)
+		require.Empty(t, quote)
+		// The pair was valid, so the lookup did happen: this is storage
+		// failing rather than the request being refused.
+		require.Equal(t, []domain.Pair{domain.Pair("EUR/MXN")}, repo.looked)
+	})
 }
