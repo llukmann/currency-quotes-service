@@ -964,3 +964,150 @@ func TestHealthzWritesNoLogLine(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Empty(t, records(), "the probe wrote to the log")
 }
+
+// brokenWriter is a response writer whose body cannot be written. It stands in
+// for the one cause writeJSON has left once marshalling is ruled out: a
+// connection that has gone while the answer was being sent.
+//
+// The status line is recorded rather than sent, since it is already out by the
+// time the body fails -- that is the whole difficulty the branch exists for.
+type brokenWriter struct {
+	header http.Header
+	status int
+	err    error
+}
+
+func (b *brokenWriter) Header() http.Header {
+	if b.header == nil {
+		b.header = make(http.Header)
+	}
+
+	return b.header
+}
+
+func (b *brokenWriter) WriteHeader(status int) {
+	b.status = status
+}
+
+func (b *brokenWriter) Write([]byte) (int, error) {
+	return 0, b.err
+}
+
+// TestWriteJSONFailureIsLoggedNotAnswered covers what happens when the body
+// cannot be written. The status and the headers are already gone, so there is
+// no way left to tell the client anything: all that remains is to write down
+// what happened, and which log that goes to depends on whose fault it was.
+func TestWriteJSONFailureIsLoggedNotAnswered(t *testing.T) {
+	tests := []struct {
+		name string
+		// abandoned cancels the request context, which is what net/http does
+		// when the connection goes away.
+		abandoned bool
+
+		wantLevel slog.Level
+		wantMsg   string
+	}{
+		{
+			// Nothing of ours failed and there is nobody to write to. At error
+			// this would sit in the error log beside a real outage.
+			name:      "a client that hung up mid-body",
+			abandoned: true,
+			wantLevel: slog.LevelInfo,
+			wantMsg:   "request abandoned by the client",
+		},
+		{
+			name:      "a write that failed for any other reason",
+			wantLevel: slog.LevelError,
+			wantMsg:   "write response",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, records := captureLogger()
+
+			svc := &fakeService{task: testTask(domain.StatusPending)}
+
+			r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`))
+
+			if tt.abandoned {
+				ctx, cancel := context.WithCancel(r.Context())
+				cancel()
+
+				r = r.WithContext(ctx)
+			}
+
+			w := &brokenWriter{err: errors.New("connection reset by peer")}
+
+			NewRouter(svc, logger, 5*time.Second).ServeHTTP(w, r)
+
+			// The status was already on the wire when the body failed, so it
+			// stands: nothing tries to replace it with an error.
+			require.Equal(t, http.StatusAccepted, w.status)
+
+			entry := requireEntry(t, records(), tt.wantMsg)
+			require.Equal(t, tt.wantLevel, entry.level())
+			require.NotEmpty(t, entry.RequestID)
+		})
+	}
+}
+
+// TestRecoverPanicPassesOnAnAbortedHandler covers the one panic that must not
+// be turned into an answer. http.ErrAbortHandler is the documented way for a
+// handler to drop a response without a word; net/http raises it and expects to
+// catch it again, so swallowing it here would turn a deliberate abort into a
+// 500 and log a fault that never happened.
+func TestRecoverPanicPassesOnAnAbortedHandler(t *testing.T) {
+	logger, records := captureLogger()
+
+	svc := &fakeService{before: func(context.Context) { panic(http.ErrAbortHandler) }}
+
+	r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`))
+	w := httptest.NewRecorder()
+
+	router := NewRouter(svc, logger, 5*time.Second)
+
+	require.PanicsWithError(t, http.ErrAbortHandler.Error(), func() {
+		router.ServeHTTP(w, r)
+	})
+
+	require.Empty(t, w.Body.String(), "an aborted handler was answered")
+
+	for _, entry := range records() {
+		require.NotEqual(t, "panic in handler", entry.Msg, "a deliberate abort was logged as a fault")
+	}
+}
+
+// TestRecoverPanicLeavesAnAnsweredRequestAlone covers the guard in front of the
+// envelope. A panic after the status has gone out cannot be reported to the
+// client at all: a second WriteHeader is refused with a complaint of its own,
+// and the envelope would land at the end of a body that is already valid.
+//
+// The chain is built here rather than taken from NewRouter because no handler
+// of this service writes and then panics -- what is under test is the
+// middleware, and it needs a handler that does.
+func TestRecoverPanicLeavesAnAnsweredRequestAlone(t *testing.T) {
+	logger, records := captureLogger()
+
+	const answer = `{"update_id":"6f1a2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d","status":"pending"}`
+
+	// The same nesting the router uses: the wrapper accessLog installs is what
+	// makes the question answerable at all.
+	chain := accessLog(logger)(recoverPanic(logger)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentTypeJSON)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = io.WriteString(w, answer)
+
+		panic("something gave way after the answer had gone")
+	})))
+
+	w := httptest.NewRecorder()
+	chain.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/quotes/updates", nil))
+
+	require.Equal(t, http.StatusAccepted, w.Code)
+	require.JSONEq(t, answer, w.Body.String())
+	require.Equal(t, answer, w.Body.String(), "an envelope was appended to an answer that had already gone")
+
+	// Reported all the same: the client cannot be told, but the log can.
+	requireEntry(t, records(), "panic in handler")
+}
