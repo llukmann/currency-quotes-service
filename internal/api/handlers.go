@@ -18,12 +18,17 @@ import (
 // attempt, and either is better refused than buffered.
 const maxRequestBody = 4 << 10
 
+// headerIdempotencyKey names one intent of one client. Optional: a post without
+// it is still deduplicated against unfinished work on the same pair, but only a
+// key can tell a retry of one request from a fresh request for the same thing.
+const headerIdempotencyKey = "Idempotency-Key"
+
 // quoteService is the business layer as seen from here: three calls, two of
 // them taking the pair as the client wrote it. Declared at the consumer, as in
 // the worker, and for the same second reason -- it is the surface a
 // hand-written fake stands in for when the handlers are tested in step 7.
 type quoteService interface {
-	CreateTask(ctx context.Context, pair string) (domain.UpdateTask, error)
+	CreateTask(ctx context.Context, pair string, key *uuid.UUID) (domain.UpdateTask, error)
 	GetTask(ctx context.Context, id uuid.UUID) (domain.TaskDetails, error)
 	GetLatestQuote(ctx context.Context, pair string) (domain.Quote, error)
 }
@@ -38,8 +43,15 @@ type handler struct {
 // the identifier to poll, never with a rate. Fetching one is the worker's, and
 // the asynchronous contract is exactly this handler not doing it.
 //
-// Answers 202, or 400 for a body that is not JSON or a pair that is not
-// supported.
+// Answers 202, 400 for a body that is not JSON, a pair that is not supported or
+// a key that is not a UUID, and 409 for a key already spent on another pair.
+//
+// A 202 here may well describe a task this request did not create: a repeat
+// carrying a live key is answered with the task the first one made, and a post
+// arriving while the pair is already being refreshed is answered with that
+// task. The status in the body is therefore the one the row carries now, which
+// can be any of the four -- a client that retried after a failure sees failed
+// and knows to send a fresh key rather than poll a task that will never move.
 func (h *handler) createTask(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 
@@ -53,19 +65,53 @@ func (h *handler) createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key, err := idempotencyKey(r)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, codeInvalidRequest, "Idempotency-Key is not a valid UUID")
+
+		return
+	}
+
 	// A missing "pair" arrives here as an empty string and is refused by the
 	// same rule as an unsupported one, with the same code: both mean the
 	// request named no pair this service can quote.
-	task, err := h.svc.CreateTask(r.Context(), req.Pair)
+	task, err := h.svc.CreateTask(r.Context(), req.Pair, key)
 
 	switch {
 	case errors.Is(err, domain.ErrInvalidPair):
 		writeErrorJSON(w, http.StatusBadRequest, codeInvalidPair, err.Error())
+	case errors.Is(err, domain.ErrKeyConflict):
+		// 409 and not 400: the request is faultless in itself -- valid body,
+		// supported pair, well formed key -- and what refuses it is the history
+		// behind that key. The two need different fixes, and a client reading
+		// the code alone has to be able to tell them apart.
+		writeErrorJSON(w, http.StatusConflict, codeKeyConflict, err.Error())
 	case err != nil:
 		h.writeInternal(w, r, err)
 	default:
 		h.writeJSON(w, r, http.StatusAccepted, newAcceptedResponse(task))
 	}
+}
+
+// idempotencyKey reads the Idempotency-Key header, returning nil when the
+// client sent none: the header is optional, and without it a post is
+// deduplicated by pair alone.
+//
+// A value that is not a UUID is refused rather than taken as an opaque string.
+// The contract asks for a UUID, and holding it to that is what bounds the size
+// of something a client controls before it reaches a column.
+func idempotencyKey(r *http.Request) (*uuid.UUID, error) {
+	raw := r.Header.Get(headerIdempotencyKey)
+	if raw == "" {
+		return nil, nil
+	}
+
+	key, err := uuid.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	return &key, nil
 }
 
 // getTask backs GET /quotes/updates/{id}, the endpoint a client polls.

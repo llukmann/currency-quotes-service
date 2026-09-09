@@ -27,9 +27,15 @@ type createTaskRequest struct {
 // client polls with, and the status the task was created in.
 //
 // The status is the one the row actually carries rather than a literal
-// "pending". Nothing else can come back today, since every post creates a task;
-// saying it this way is what keeps the answer honest in step 6, where a post
-// that finds an existing task may find it already in progress.
+// "pending", and it can be any of the four: a post that deduplicates onto
+// existing work may find it in progress, and one repeating a live idempotency
+// key may find the task long finished, or failed.
+//
+// Two fields and no more, whichever of those it is. A rate served here would
+// invite reading this endpoint as a synchronous quote, which is the one thing
+// the asynchronous contract exists to prevent, and a reason for a failure has a
+// canonical home in GET /quotes/updates/{id}; duplicating it would be a second
+// place to keep true.
 type acceptedResponse struct {
 	UpdateID string `json:"update_id"`
 	Status   string `json:"status"`

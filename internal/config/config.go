@@ -29,6 +29,9 @@ const (
 	defaultWorkerStuckTimeout     = 60 * time.Second
 	defaultWorkerRecoveryInterval = 30 * time.Second
 	defaultWorkerMaxAttempts      = 3
+
+	defaultIdempotencyTTL             = time.Hour
+	defaultIdempotencyCleanupInterval = 10 * time.Minute
 )
 
 // Valid TCP port range. Port 0 is excluded: it would make the server pick an
@@ -93,6 +96,18 @@ type Config struct {
 	// WorkerMaxAttempts is how many times a task may be claimed before the
 	// recovery pass closes it as failed instead of releasing it once more.
 	WorkerMaxAttempts int
+
+	// IdempotencyTTL is how long the binding between an Idempotency-Key and
+	// the task it was answered with holds. It is also the longest a post can
+	// silently perform no update at all, which is why it is far shorter than
+	// the day such keys are conventionally kept: a client repeating a live key
+	// is handed the earlier task rather than a fresh rate.
+	IdempotencyTTL time.Duration
+	// IdempotencyCleanupInterval is how often expired bindings are swept. The
+	// sweep is the only thing enforcing the lifetime above -- a lookup never
+	// checks the age of what it finds -- so this interval is the margin by
+	// which a binding outlives it.
+	IdempotencyCleanupInterval time.Duration
 }
 
 // Load reads the configuration from the environment. Unset variables fall
@@ -153,6 +168,13 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	if cfg.IdempotencyTTL, err = durationFromEnv("IDEMPOTENCY_TTL", defaultIdempotencyTTL); err != nil {
+		return Config{}, err
+	}
+	if cfg.IdempotencyCleanupInterval, err = durationFromEnv("IDEMPOTENCY_CLEANUP_INTERVAL", defaultIdempotencyCleanupInterval); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
 }
 
@@ -162,7 +184,8 @@ func Load() (Config, error) {
 // unbounded, a task deadline too short for a full retry schedule would cut the
 // provider off halfway through every slow call, and a staleness threshold too
 // close to that deadline would have the recovery pass take tasks away from
-// workers that are still working on them.
+// workers that are still working on them, and a sweep of idempotency keys
+// rarer than the lifetime it is there to enforce would quietly multiply it.
 //
 // providerBudget is the longest a single provider call can take, retries and
 // backoff included. It is passed in rather than worked out here so that this
@@ -188,6 +211,16 @@ func (c Config) CheckTimeouts(providerBudget time.Duration) error {
 		return fmt.Errorf(
 			"WORKER_STUCK_TIMEOUT: %s is less than %s, which is %d times WORKER_TASK_TIMEOUT",
 			c.WorkerStuckTimeout, minStuck, stuckTimeoutMargin,
+		)
+	}
+
+	// A sweep rarer than the lifetime it enforces would not shorten a binding,
+	// it would stretch it: nothing else expires one, so the interval is the
+	// error bar on the whole setting, and it is only meaningful below it.
+	if c.IdempotencyCleanupInterval >= c.IdempotencyTTL {
+		return fmt.Errorf(
+			"IDEMPOTENCY_CLEANUP_INTERVAL: %s is not shorter than the IDEMPOTENCY_TTL of %s it enforces",
+			c.IdempotencyCleanupInterval, c.IdempotencyTTL,
 		)
 	}
 

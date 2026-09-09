@@ -1,13 +1,14 @@
 package config
 
 import (
+	"cmp"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-// TestConfigCheckTimeouts pins the three invariants the service refuses to
+// TestConfigCheckTimeouts pins the four invariants the service refuses to
 // start without. They are worth a test of their own now that Load no longer
 // runs them: the check is one call in main away from being forgotten, and it is
 // cheap to state here what it must reject. The numbers are the configured
@@ -19,6 +20,12 @@ func TestConfigCheckTimeouts(t *testing.T) {
 		providerBudget time.Duration
 		taskTimeout    time.Duration
 		stuckTimeout   time.Duration
+		// The sweep of idempotency keys and the lifetime it enforces. Left at
+		// zero by every case that is about one of the other three rules, which
+		// the fixture then fills with a valid pair: a case states the rule it
+		// is about and stays silent on the rest.
+		cleanupInterval time.Duration
+		idempotencyTTL  time.Duration
 		// wantErr is the variable the failure has to name; empty means the
 		// combination must be accepted.
 		wantErr string
@@ -80,6 +87,27 @@ func TestConfigCheckTimeouts(t *testing.T) {
 			taskTimeout:    15 * time.Second,
 			stuckTimeout:   30 * time.Second,
 		},
+		{
+			// Equal is already wrong: the sweep is the only thing that ends a
+			// binding, so an interval that matches the lifetime doubles it.
+			name:            "a sweep as rare as the lifetime it enforces is refused",
+			writeTimeout:    10 * time.Second,
+			providerBudget:  5 * time.Second,
+			taskTimeout:     15 * time.Second,
+			stuckTimeout:    time.Minute,
+			cleanupInterval: time.Hour,
+			idempotencyTTL:  time.Hour,
+			wantErr:         "IDEMPOTENCY_CLEANUP_INTERVAL",
+		},
+		{
+			name:            "the configured sweep and lifetime hold",
+			writeTimeout:    10 * time.Second,
+			providerBudget:  5 * time.Second,
+			taskTimeout:     15 * time.Second,
+			stuckTimeout:    time.Minute,
+			cleanupInterval: defaultIdempotencyCleanupInterval,
+			idempotencyTTL:  defaultIdempotencyTTL,
+		},
 	}
 
 	for _, tt := range tests {
@@ -88,6 +116,10 @@ func TestConfigCheckTimeouts(t *testing.T) {
 				HTTPWriteTimeout:   tt.writeTimeout,
 				WorkerTaskTimeout:  tt.taskTimeout,
 				WorkerStuckTimeout: tt.stuckTimeout,
+				// A valid pair stands in wherever a case did not care, so that
+				// the rule under test is the only one that can fail it.
+				IdempotencyCleanupInterval: cmp.Or(tt.cleanupInterval, time.Minute),
+				IdempotencyTTL:             cmp.Or(tt.idempotencyTTL, time.Hour),
 			}
 
 			err := cfg.CheckTimeouts(tt.providerBudget)
