@@ -10,6 +10,8 @@ import (
 
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+
+	"github.com/llukmann/currency-quotes-service/internal/api/contract"
 )
 
 // requestIDHeader carries the identifier back to the client, which is the only
@@ -100,7 +102,7 @@ func accessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 // doing then fails with a context error, which is served as internal_error --
 // a code the contract describes, through the envelope the contract describes.
 // chi's own middleware.Timeout was not used for both halves of that: it answers
-// with a bare 504, which api.md lists for no endpoint, and it writes that 504
+// with a bare 504, which the spec lists for no endpoint, and it writes that 504
 // from a deferred call without checking whether the handler has already
 // answered, so a request finishing just as the deadline lands gets a second
 // WriteHeader on top of a response that was already correct.
@@ -159,7 +161,7 @@ func recoverPanic(logger *slog.Logger) func(http.Handler) http.Handler {
 					return
 				}
 
-				writeErrorJSON(w, http.StatusInternalServerError, codeInternalError, internalErrorMessage)
+				writeErrorJSON(w, http.StatusInternalServerError, contract.ErrorCodeInternalError, internalErrorMessage)
 			}(r.Context())
 
 			next.ServeHTTP(w, r)

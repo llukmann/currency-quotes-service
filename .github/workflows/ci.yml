@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # The spec drives the transport, and this is what keeps that true: a
+      # regeneration nobody ran is a difference nobody sees until the two have
+      # drifted.
+      - name: generated contract matches the spec
+        run: |
+          go generate ./...
+          git diff --exit-code -- internal/api/contract
+
+      # The clean-clone promise: with no database the storage tests skip
+      # themselves and everything else still passes.
+      - name: tests without a database
+        run: go test ./...
+
+      # The commands .env.example gives a human, run as written, so that
+      # instructions which stop working stop the build with them.
+      - name: schema
+        run: |
+          docker compose run --rm migrate
+          docker compose exec -T postgres psql -U quotes -d quotes -c 'CREATE DATABASE quotes_test'
+          docker compose run --rm migrate -path=/migrations \
+            -database "postgres://quotes:quotes@postgres:5432/quotes_test?sslmode=disable" up
+
+      # The only place the SQL is exercised at all, and the only place the race
+      # detector runs: it needs cgo, which a Windows checkout does not have.
+      - name: tests with a database, under the race detector
+        env:
+          TEST_DATABASE_URL: postgres://quotes:quotes@localhost:5432/quotes_test?sslmode=disable
+        run: go test -race ./...
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # docker compose up --build is how the stack is meant to be started,
+      # and the jobs above never build the service image.
+      - name: the service image builds
+        run: docker compose build quotes

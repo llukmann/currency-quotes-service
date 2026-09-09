@@ -31,12 +31,13 @@ CREATE TABLE idempotency_keys (
     update_id  uuid        NOT NULL REFERENCES quote_updates (id),
     -- When the binding was made, which is not the task's own created_at: a post
     -- that deduplicates binds its key to a task created before it, and the
-    -- lifetime has to be measured from the binding. The background sweep is the
-    -- only thing that enforces that lifetime -- a lookup never checks the age
-    -- of what it finds, so a row that exists is a binding that holds.
+    -- lifetime has to be measured from the binding. Every read of a key weighs
+    -- this against the lifetime, and that is the whole of the enforcement:
+    -- nothing deletes an expired row, a lookup stops seeing it and the next
+    -- post carrying that key takes it over.
     --
-    -- Deliberately unindexed. The table is bounded by the lifetime times the
-    -- rate of posts and stays small enough for the sweep to scan, while an
-    -- index would cost on every insert, which is the hot path of a post.
+    -- Deliberately unindexed. It is only ever read beside key, which is the
+    -- primary key here, so the row is found before the age is looked at, while
+    -- an index would cost on every insert -- the hot path of a post.
     created_at timestamptz NOT NULL DEFAULT now()
 );

@@ -83,9 +83,9 @@ func (s *stubRepo) GetLatestQuote(ctx context.Context, pair domain.Pair) (domain
 	return s.quote, nil
 }
 
-// TestServiceCreateTask covers the two decisions this method owns: a pair is
-// validated and normalised before anything reaches storage, and a worker is
-// woken only for a task that is actually waiting to be claimed.
+// TestServiceCreateTask covers the one decision this method owns: a worker is
+// woken only for a task that is actually waiting to be claimed. The pair
+// arrives already parsed, so there is nothing left here to refuse.
 func TestServiceCreateTask(t *testing.T) {
 	key := uuid.New()
 	conflict := domain.ErrKeyConflict
@@ -93,7 +93,7 @@ func TestServiceCreateTask(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		pair       string
+		pair       domain.Pair
 		key        *uuid.UUID
 		repoStatus domain.Status
 		createErr  error
@@ -107,16 +107,6 @@ func TestServiceCreateTask(t *testing.T) {
 		{
 			name:       "a queued task wakes a worker",
 			pair:       "EUR/MXN",
-			repoStatus: domain.StatusPending,
-			wantPair:   domain.Pair("EUR/MXN"),
-			wantWake:   true,
-		},
-		{
-			// The pair storage sees is the canonical one, which is what keeps
-			// two spellings of one pair from becoming two rows and what an
-			// idempotency key is later compared against.
-			name:       "the pair is normalised before it reaches storage",
-			pair:       "eur/mxn",
 			repoStatus: domain.StatusPending,
 			wantPair:   domain.Pair("EUR/MXN"),
 			wantWake:   true,
@@ -151,19 +141,6 @@ func TestServiceCreateTask(t *testing.T) {
 			key:        &key,
 			repoStatus: domain.StatusFailed,
 			wantPair:   domain.Pair("EUR/MXN"),
-		},
-		{
-			// The rule the whitelist exists for: nothing in the schema would
-			// have caught this, so a pair refused here is a pair that never
-			// reaches a row.
-			name:    "an unsupported pair never reaches storage",
-			pair:    "EUR/RUB",
-			wantErr: domain.ErrInvalidPair,
-		},
-		{
-			name:    "a malformed pair never reaches storage",
-			pair:    "EURMXN",
-			wantErr: domain.ErrInvalidPair,
 		},
 		{
 			name:      "a key already spent on another pair is reported as such",
@@ -327,10 +304,8 @@ func TestServiceGetTaskNotFound(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrNotFound)
 }
 
-// TestServiceGetLatestQuote covers the second endpoint that validates a pair.
-// The refusal matters as much as the answer: an unsupported pair has to be
-// refused outright rather than answered with a 404, which would suggest it
-// might exist once somebody posts an update for it.
+// TestServiceGetLatestQuote covers the read: the pair reaches storage as it was
+// handed in, and what storage answers is what the caller gets.
 func TestServiceGetLatestQuote(t *testing.T) {
 	quote := domain.Quote{
 		UpdateID:  uuid.New(),
@@ -342,38 +317,20 @@ func TestServiceGetLatestQuote(t *testing.T) {
 
 	tests := []struct {
 		name string
-		pair string
+		pair domain.Pair
 
-		wantPair domain.Pair
 		quoteErr error
 		wantErr  error
 	}{
 		{
-			name:     "a stored rate is returned as it stands",
-			pair:     "EUR/MXN",
-			wantPair: domain.Pair("EUR/MXN"),
-		},
-		{
-			name:     "the pair is normalised before it reaches storage",
-			pair:     "eur/mxn",
-			wantPair: domain.Pair("EUR/MXN"),
+			name: "a stored rate is returned as it stands",
+			pair: domain.Pair("EUR/MXN"),
 		},
 		{
 			name:     "a supported pair nobody has quoted is not found",
-			pair:     "USD/MXN",
-			wantPair: domain.Pair("USD/MXN"),
+			pair:     domain.Pair("USD/MXN"),
 			quoteErr: domain.ErrNotFound,
 			wantErr:  domain.ErrNotFound,
-		},
-		{
-			name:    "an unsupported pair never reaches storage",
-			pair:    "EUR/RUB",
-			wantErr: domain.ErrInvalidPair,
-		},
-		{
-			name:    "a missing pair never reaches storage",
-			pair:    "",
-			wantErr: domain.ErrInvalidPair,
 		},
 	}
 
@@ -391,11 +348,7 @@ func TestServiceGetLatestQuote(t *testing.T) {
 				require.Equal(t, quote, got)
 			}
 
-			if tt.wantPair == "" {
-				require.Empty(t, repo.looked)
-			} else {
-				require.Equal(t, []domain.Pair{tt.wantPair}, repo.looked)
-			}
+			require.Equal(t, []domain.Pair{tt.pair}, repo.looked)
 		})
 	}
 }
@@ -480,61 +433,6 @@ func TestServicePassesTheCallersContext(t *testing.T) {
 			require.ErrorIs(t, got.Err(), context.Canceled, "storage was handed a context that outlives the caller")
 		})
 	}
-}
-
-// TestServiceCreateTaskReturnsTheParseErrorUnchanged pins a decision the
-// handler depends on and cannot see. The sentence ParsePair writes names the
-// currency at fault and is served to the client as the message of an
-// invalid_pair, so wrapping it here would put the name of an internal
-// operation into an answer written to be read from outside.
-//
-// Compared against what ParsePair itself returns rather than against a literal:
-// the wording is the domain's to change, and what this test is about is that
-// nothing was added to it on the way through.
-func TestServiceCreateTaskReturnsTheParseErrorUnchanged(t *testing.T) {
-	const pair = "EUR/RUB"
-
-	_, want := domain.ParsePair(pair)
-	require.Error(t, want)
-
-	repo := &stubRepo{}
-
-	_, err := New(repo, nil).CreateTask(t.Context(), pair, nil)
-
-	require.EqualError(t, err, want.Error())
-	require.Empty(t, repo.created)
-}
-
-// TestServiceGetLatestQuoteReturnsTheParseErrorUnchanged is the same rule on
-// the endpoint that validates the other pair a client can send.
-func TestServiceGetLatestQuoteReturnsTheParseErrorUnchanged(t *testing.T) {
-	const pair = "EUR/RUB"
-
-	_, want := domain.ParsePair(pair)
-	require.Error(t, want)
-
-	repo := &stubRepo{}
-
-	_, err := New(repo, nil).GetLatestQuote(t.Context(), pair)
-
-	require.EqualError(t, err, want.Error())
-	require.Empty(t, repo.looked)
-}
-
-// TestServiceCreateTaskRefusesThePairBeforeTheKey checks the order the two
-// checks happen in. A key is compared against the pair its task was queued
-// for, so the pair has to be the normalised one by then -- and a request
-// naming no pair this service can quote is refused whether it carries a key or
-// not, without the key ever being looked at.
-func TestServiceCreateTaskRefusesThePairBeforeTheKey(t *testing.T) {
-	key := uuid.New()
-
-	repo := &stubRepo{}
-
-	_, err := New(repo, nil).CreateTask(t.Context(), "EUR/RUB", &key)
-
-	require.ErrorIs(t, err, domain.ErrInvalidPair)
-	require.Empty(t, repo.created, "the key reached storage under a pair that was never valid")
 }
 
 // TestServiceGettersPassStorageFailuresUp checks that a database that has

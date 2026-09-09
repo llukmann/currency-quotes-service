@@ -1,17 +1,14 @@
-// Package api holds the HTTP layer: router, middleware, handlers and the DTOs
-// they answer with.
+// Package api is the HTTP layer: router, middleware, handlers and the
+// translation between the wire and the domain.
+//
+// The shapes on the wire are not written here. They are generated from
+// api/openapi.yaml into internal/api/contract, and the handlers below satisfy
+// the interface generated with them, so a route, a parameter or a field that
+// changes in the spec and not in this package stops the build.
 //
 // Nothing below this package knows about HTTP, and nothing above it sees a
-// domain type: the DTOs here are what translate between the two vocabularies,
-// so that renaming a field of an entity is not a change of contract.
-//
-// That split runs through the names in this package. The Go identifiers follow
-// the domain, where the queued entity is an UpdateTask -- hence createTask,
-// getTask and taskResponse -- while the JSON keys keep the word a client knows
-// it by, update_id under /quotes/updates, which is what api.md fixes. Only the
-// DTOs are allowed to hold both. This is
-// also where errors stop carrying their causes -- what a client is told and
-// what the log is told part company in writeInternal.
+// domain type. This is also where errors stop carrying their causes -- what a
+// client is told and what the log is told part company in writeInternal.
 package api
 
 import (
@@ -20,6 +17,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/llukmann/currency-quotes-service/internal/api/contract"
 )
 
 // NewRouter wires up the service routes.
@@ -58,18 +57,16 @@ func NewRouter(svc quoteService, logger *slog.Logger, handlerTimeout time.Durati
 			recoverPanic(logger),
 		)
 
-		r.Post("/quotes/updates", h.createTask)
-		r.Get("/quotes/updates/{id}", h.getTask)
-		r.Get("/quotes/latest", h.getLatestQuote)
+		// Registered on this group rather than through the Middlewares option
+		// of the generated server: that option wraps the handler alone, leaving
+		// the parameter binding -- and every answer writeParamError gives for
+		// it -- outside the chain, without a request id and unseen by the
+		// access log.
+		contract.HandlerWithOptions(h, contract.ChiServerOptions{
+			BaseRouter:       r,
+			ErrorHandlerFunc: h.writeParamError,
+		})
 	})
 
 	return r
-}
-
-// handleHealth backs the docker compose healthcheck. It is not part of the
-// business API and is not described in the OpenAPI spec.
-func handleHealth(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", contentTypeJSON)
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
 }

@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/llukmann/currency-quotes-service/internal/api"
@@ -37,15 +36,6 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	// The budget of one provider call, which only the provider package can work
-	// out: the jitter window is part of its retry schedule. Checked here, where
-	// both packages are already in hand, so that the configuration stays a leaf
-	// of the dependency graph.
-	providerBudget := provider.Budget(cfg.ProviderAttempts, cfg.ProviderTimeout, cfg.ProviderBackoff)
-	if err := cfg.CheckTimeouts(providerBudget); err != nil {
-		return fmt.Errorf("check config: %w", err)
-	}
-
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
 
@@ -55,25 +45,15 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Before the server accepts anything: a schema older than the binary would
-	// only surface later, as failing queries.
-	if err := postgres.Migrate(ctx, cfg.DatabaseURL, logger); err != nil {
-		return fmt.Errorf("migrate: %w", err)
-	}
-
-	// Sized by pool_max_conns in the connection string, so there is no setting
-	// of ours to pass here. No ping either: the migration above just proved the
-	// database is reachable, and pgxpool opens its connections on demand.
-	//
 	// Closed by the deferred call rather than by whoever uses it, and that
 	// happens after the group below has been waited on -- a pool closed while
 	// a worker still holds a connection would fail the very finalisation the
 	// shutdown is waiting for.
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	repo, err := postgres.New(ctx, cfg.DatabaseURL, cfg.IdempotencyTTL)
 	if err != nil {
-		return fmt.Errorf("connect to database: %w", err)
+		return err
 	}
-	defer pool.Close()
+	defer repo.Close()
 
 	// The retrier is what the worker holds: how many times an upstream is asked
 	// is a property of the call, not a decision the worker makes each time.
@@ -82,8 +62,6 @@ func run() error {
 		cfg.ProviderAttempts,
 		cfg.ProviderBackoff,
 	)
-
-	repo := postgres.NewRepository(pool)
 
 	// The signal that a task has just been posted: written by the handler path,
 	// read by whichever worker is idle. Buffered by one and written without
@@ -103,11 +81,6 @@ func run() error {
 		Interval:     cfg.WorkerRecoveryInterval,
 		StuckTimeout: cfg.WorkerStuckTimeout,
 		MaxAttempts:  cfg.WorkerMaxAttempts,
-	}, logger)
-
-	cleanup := worker.NewCleanup(repo, worker.CleanupSettings{
-		Interval: cfg.IdempotencyCleanupInterval,
-		TTL:      cfg.IdempotencyTTL,
 	}, logger)
 
 	srv := &http.Server{
@@ -145,8 +118,6 @@ func run() error {
 	}
 
 	g.Go(func() error { return recovery.Run(ctx) })
-
-	g.Go(func() error { return cleanup.Run(ctx) })
 
 	g.Go(func() error {
 		<-ctx.Done()
