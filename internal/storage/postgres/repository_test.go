@@ -96,7 +96,7 @@ func newRepo(t *testing.T) *Repository {
 	_, err := pool.Exec(t.Context(), `TRUNCATE quotes, idempotency_keys, quote_updates`)
 	require.NoError(t, err)
 
-	return NewRepository(pool)
+	return &Repository{pool: pool}
 }
 
 // createTask queues a refresh and fails the test if it could not be queued.

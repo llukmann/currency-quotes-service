@@ -25,10 +25,24 @@ type Repository struct {
 	pool *pgxpool.Pool
 }
 
-// NewRepository returns a repository backed by pool. The pool is owned by the
-// caller, which also closes it.
-func NewRepository(pool *pgxpool.Pool) *Repository {
-	return &Repository{pool: pool}
+// New opens a pool against databaseURL and returns a repository over it. The
+// pool is sized by pool_max_conns in the connection string, so there is no
+// setting of ours to pass here, and it opens its connections on demand: this
+// call does not prove the database is reachable.
+//
+// The caller closes the repository, which closes the pool.
+func New(ctx context.Context, databaseURL string) (*Repository, error) {
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect to database: %w", err)
+	}
+
+	return &Repository{pool: pool}, nil
+}
+
+// Close releases the pool and waits for the connections in use to be returned.
+func (r *Repository) Close() {
+	r.pool.Close()
 }
 
 // uniqueViolation is the SQLSTATE Postgres reports for a duplicate key.

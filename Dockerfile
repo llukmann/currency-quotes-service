@@ -8,7 +8,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/quotes ./cmd/quotes
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/quotes .
 
 FROM alpine:3.23
 

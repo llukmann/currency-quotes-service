@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/llukmann/currency-quotes-service/internal/api"
@@ -61,19 +60,15 @@ func run() error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 
-	// Sized by pool_max_conns in the connection string, so there is no setting
-	// of ours to pass here. No ping either: the migration above just proved the
-	// database is reachable, and pgxpool opens its connections on demand.
-	//
 	// Closed by the deferred call rather than by whoever uses it, and that
 	// happens after the group below has been waited on -- a pool closed while
 	// a worker still holds a connection would fail the very finalisation the
 	// shutdown is waiting for.
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	repo, err := postgres.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		return fmt.Errorf("connect to database: %w", err)
+		return err
 	}
-	defer pool.Close()
+	defer repo.Close()
 
 	// The retrier is what the worker holds: how many times an upstream is asked
 	// is a property of the call, not a decision the worker makes each time.
@@ -82,8 +77,6 @@ func run() error {
 		cfg.ProviderAttempts,
 		cfg.ProviderBackoff,
 	)
-
-	repo := postgres.NewRepository(pool)
 
 	// The signal that a task has just been posted: written by the handler path,
 	// read by whichever worker is idle. Buffered by one and written without
