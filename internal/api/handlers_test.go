@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -740,4 +741,226 @@ func boolToInt(b bool) int {
 	}
 
 	return 0
+}
+
+// logEntry is one structured record, decoded from what the logger wrote.
+//
+// Only the fields the tests below ask about. Every one of them is part of a
+// decision written down in this package: which log a failure goes to, whether
+// the cause was recorded at all, and whether the line can be tied to the
+// identifier the client was handed.
+type logEntry struct {
+	Level     string `json:"level"`
+	Msg       string `json:"msg"`
+	Error     string `json:"error"`
+	Panic     string `json:"panic"`
+	RequestID string `json:"request_id"`
+	Method    string `json:"method"`
+	Path      string `json:"path"`
+	Status    int    `json:"status"`
+}
+
+func (e logEntry) level() slog.Level {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(e.Level)); err != nil {
+		return slog.LevelInfo
+	}
+
+	return level
+}
+
+// captureLogger returns a logger writing structured records, and a function
+// reading back what it has written so far.
+//
+// The tests that use it are the ones about the log itself. Everywhere else the
+// discard logger stays: what a handler answers and what it writes down are
+// separate questions, and only the second needs this.
+func captureLogger() (*slog.Logger, func() []logEntry) {
+	var buf bytes.Buffer
+
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	return logger, func() []logEntry {
+		var entries []logEntry
+
+		for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+			if line == "" {
+				continue
+			}
+
+			var entry logEntry
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				continue
+			}
+
+			entries = append(entries, entry)
+		}
+
+		return entries
+	}
+}
+
+// requireEntry finds the one record with this message and fails the test when
+// there is none.
+func requireEntry(t *testing.T, entries []logEntry, msg string) logEntry {
+	t.Helper()
+
+	for _, entry := range entries {
+		if entry.Msg == msg {
+			return entry
+		}
+	}
+
+	t.Fatalf("no log record %q among %d written", msg, len(entries))
+
+	return logEntry{}
+}
+
+// TestLogRecordsTheCauseOfAFailure is the other half of the rule
+// TestCreateTaskHidesTheCause states. The client is told the code alone, which
+// only works because the cause is written down somewhere -- and nothing else
+// in this package would notice if it were not: the answer is identical either
+// way, and the request would become unexplainable rather than merely opaque.
+func TestLogRecordsTheCauseOfAFailure(t *testing.T) {
+	const cause = "dial tcp 10.0.0.7:5432: connect: connection refused"
+
+	logger, records := captureLogger()
+
+	svc := &fakeService{createErr: errors.New(cause)}
+
+	r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`))
+	w := httptest.NewRecorder()
+
+	NewRouter(svc, logger, 5*time.Second).ServeHTTP(w, r)
+
+	requireEnvelope(t, w, http.StatusInternalServerError, codeInternalError)
+	require.NotContains(t, w.Body.String(), cause)
+
+	entry := requireEntry(t, records(), "request failed")
+
+	require.Equal(t, slog.LevelError, entry.level())
+	require.Contains(t, entry.Error, cause)
+	require.Equal(t, http.MethodPost, entry.Method)
+	require.Equal(t, "/quotes/updates", entry.Path)
+	require.NotEmpty(t, entry.RequestID)
+}
+
+// TestLogRecordsAnAbandonedRequestAtInfo pins the level, which is the whole of
+// the decision. Nothing of ours failed: there is no answer to write and nobody
+// to write it to. At error the line would sit in the error log beside a real
+// outage, to be told apart by hand at exactly the moment nobody has time for
+// it -- a closed tab and a database that has stopped answering would look
+// alike.
+func TestLogRecordsAnAbandonedRequestAtInfo(t *testing.T) {
+	logger, records := captureLogger()
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	svc := &fakeService{
+		before:    func(context.Context) { cancel() },
+		createErr: context.Canceled,
+	}
+
+	r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`)).
+		WithContext(ctx)
+
+	NewRouter(svc, logger, 5*time.Second).ServeHTTP(httptest.NewRecorder(), r)
+
+	entry := requireEntry(t, records(), "request abandoned by the client")
+	require.Equal(t, slog.LevelInfo, entry.level())
+
+	// The cancellation is carried in all the same: a database already refusing
+	// connections when the client hung up would otherwise be written down
+	// nowhere at all.
+	require.NotEmpty(t, entry.Error)
+
+	for _, got := range records() {
+		require.NotEqual(t, slog.LevelError, got.level(), "a client leaving was reported as a failure of ours")
+	}
+}
+
+// TestAccessLogReportsTheStatusOfARecoveredPanic is why recoverPanic sits
+// inside accessLog rather than around it. The other way round the panic would
+// pass the access log on its way out, the line would report a status of zero,
+// and the 500 the client actually received would appear nowhere.
+func TestAccessLogReportsTheStatusOfARecoveredPanic(t *testing.T) {
+	logger, records := captureLogger()
+
+	svc := &fakeService{before: func(context.Context) { panic("something in the service gave way") }}
+
+	r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`))
+	w := httptest.NewRecorder()
+
+	NewRouter(svc, logger, 5*time.Second).ServeHTTP(w, r)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+
+	entry := requireEntry(t, records(), "request")
+	require.Equal(t, http.StatusInternalServerError, entry.Status)
+}
+
+// TestAccessLogCarriesTheRequestIDTheClientGot ties the two ends of the
+// identifier together. It is returned in a header so that a client can quote
+// it when reporting a problem, which is worth nothing unless the same value is
+// the one the log lines of that request were written under.
+func TestAccessLogCarriesTheRequestIDTheClientGot(t *testing.T) {
+	logger, records := captureLogger()
+
+	svc := &fakeService{task: testTask(domain.StatusPending)}
+
+	r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`))
+	w := httptest.NewRecorder()
+
+	NewRouter(svc, logger, 5*time.Second).ServeHTTP(w, r)
+
+	served := w.Header().Get(requestIDHeader)
+	require.NotEmpty(t, served)
+
+	entry := requireEntry(t, records(), "request")
+	require.Equal(t, served, entry.RequestID)
+	require.Equal(t, http.StatusAccepted, entry.Status)
+	require.Equal(t, http.MethodPost, entry.Method)
+	require.Equal(t, "/quotes/updates", entry.Path)
+}
+
+// TestAccessLogReportsZeroWhenNothingWasWritten covers the shape an abandoned
+// request takes in the access log. writeInternal declined to answer a
+// connection that is gone and net/http had nobody to send its default 200 to
+// either, so the line carries no status at all -- and the info line with the
+// same request id beside it is what says why.
+func TestAccessLogReportsZeroWhenNothingWasWritten(t *testing.T) {
+	logger, records := captureLogger()
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	svc := &fakeService{
+		before:    func(context.Context) { cancel() },
+		createErr: context.Canceled,
+	}
+
+	r := httptest.NewRequest(http.MethodPost, "/quotes/updates", strings.NewReader(`{"pair":"EUR/MXN"}`)).
+		WithContext(ctx)
+
+	NewRouter(svc, logger, 5*time.Second).ServeHTTP(httptest.NewRecorder(), r)
+
+	access := requireEntry(t, records(), "request")
+	abandoned := requireEntry(t, records(), "request abandoned by the client")
+
+	require.Zero(t, access.Status)
+	require.Equal(t, access.RequestID, abandoned.RequestID, "the two lines of one request cannot be tied together")
+}
+
+// TestHealthzWritesNoLogLine states directly what the missing request id only
+// implies. The compose healthcheck calls the probe every five seconds --
+// seventeen thousand lines a day, in which anything worth reading would be
+// lost -- and keeping it out of the log is the reason it is registered outside
+// the middleware group at all.
+func TestHealthzWritesNoLogLine(t *testing.T) {
+	logger, records := captureLogger()
+
+	w := httptest.NewRecorder()
+	NewRouter(&fakeService{}, logger, 5*time.Second).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Empty(t, records(), "the probe wrote to the log")
 }
