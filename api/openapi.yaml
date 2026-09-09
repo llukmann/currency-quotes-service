@@ -285,8 +285,10 @@ components:
         the same 202, whatever became of that task since. A new attempt at a
         refresh is a new intent and needs a new key.
 
-        The binding between a key and its task lives at least an hour. After
-        that the same key queues a new task.
+        The binding between a key and its task lives for a configurable time,
+        an hour by default, and in practice a little longer: a background
+        sweep is what removes it. Once it is gone, the same key queues a new
+        task.
       schema:
         type: string
         format: uuid
