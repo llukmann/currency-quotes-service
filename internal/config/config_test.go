@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -455,5 +456,149 @@ func TestLoadLogLevelSpellings(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, tt.want, cfg.LogLevel)
 		})
+	}
+}
+
+// The defaults of this service exist in three places: the constants above, the
+// values in .env.example and the substitutions in docker-compose.yml. Two of
+// those are documentation of the third, and nothing but the tests below keeps
+// any of them in step -- the omission has already happened once, when the
+// idempotency settings reached the code and .env.example but not the container.
+//
+// Both checks work the same way: whatever the file says is applied to the
+// environment, Load is run over it, and the result has to be the one an empty
+// environment produces. Comparing configurations rather than strings means
+// neither test has to know how a duration is spelled, and neither holds a copy
+// of a value that could drift on its own.
+const (
+	envExamplePath = "../../.env.example"
+	composePath    = "../../docker-compose.yml"
+)
+
+// envFileDefaults reads the KEY=value lines of .env.example. Comments, blank
+// lines and variables left without a value are skipped: the last of those is
+// how the file marks a variable that has no default at all.
+func envFileDefaults(t *testing.T) map[string]string {
+	t.Helper()
+
+	content, err := os.ReadFile(envExamplePath)
+	require.NoError(t, err)
+
+	values := make(map[string]string)
+
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || value == "" {
+			continue
+		}
+
+		values[key] = value
+	}
+
+	return values
+}
+
+// composeDefaults reads the "NAME: ${NAME:-value}" substitutions out of
+// docker-compose.yml.
+//
+// Only that exact shape, which is what makes DATABASE_URL fall out on its own:
+// it is assembled there from the POSTGRES_* values rather than defaulted, so it
+// has no default of its own to compare.
+func composeDefaults(t *testing.T) map[string]string {
+	t.Helper()
+
+	content, err := os.ReadFile(composePath)
+	require.NoError(t, err)
+
+	pattern := regexp.MustCompile(`(?m)^\s*([A-Z][A-Z0-9_]*):\s*\$\{([A-Z][A-Z0-9_]*):-([^}]*)\}\s*$`)
+
+	values := make(map[string]string)
+
+	for _, m := range pattern.FindAllStringSubmatch(string(content), -1) {
+		// A variable passed into the container under one name and defaulted
+		// from another would be a different setting wearing its label.
+		if m[1] != m[2] {
+			continue
+		}
+
+		values[m[1]] = m[3]
+	}
+
+	return values
+}
+
+// requireLoadsToTheDefaults checks that applying values to the environment
+// yields the configuration an empty environment does.
+func requireLoadsToTheDefaults(t *testing.T, values map[string]string) {
+	t.Helper()
+
+	defaults, err := loadWith(t, map[string]string{"DATABASE_URL": testDatabaseDSN})
+	require.NoError(t, err)
+
+	withValues := make(map[string]string, len(values)+1)
+	for name, value := range values {
+		withValues[name] = value
+	}
+	// The one variable without a default is held the same on both sides, so
+	// that the comparison is about everything else.
+	withValues["DATABASE_URL"] = testDatabaseDSN
+
+	got, err := loadWith(t, withValues)
+	require.NoError(t, err)
+
+	require.Equal(t, defaults, got)
+}
+
+// TestEnvExampleMatchesTheDefaults checks the claim the file opens with -- that
+// its values mirror the ones compiled in. A reader who copies it to .env has to
+// get the service the defaults describe, and an operator reading it to find out
+// what a setting currently is has to be reading the truth.
+func TestEnvExampleMatchesTheDefaults(t *testing.T) {
+	requireLoadsToTheDefaults(t, envFileDefaults(t))
+}
+
+// TestEnvExampleListsEveryVariable is the half the comparison above cannot
+// make. A variable missing from the file loads its default on both sides and
+// the values agree, so only the names can catch it -- and a setting that exists
+// but is written down nowhere is one nobody knows to reach for.
+func TestEnvExampleListsEveryVariable(t *testing.T) {
+	documented := envFileDefaults(t)
+
+	for _, name := range serviceVariables(t) {
+		// DATABASE_URL has no default, and the file carries it as an example
+		// rather than as one; it is listed all the same, which is what this
+		// asks about.
+		require.Containsf(t, documented, name, "%s is read by Load but not listed in .env.example", name)
+	}
+}
+
+// TestComposeMatchesTheDefaults checks the copy that actually runs. The
+// defaults are repeated in the compose file so that a clean clone comes up
+// without an .env beside it, which means an operator reading either file has to
+// find the same service described.
+func TestComposeMatchesTheDefaults(t *testing.T) {
+	requireLoadsToTheDefaults(t, composeDefaults(t))
+}
+
+// TestComposePassesEveryVariable is the omission that has already happened: a
+// setting added to the code and to .env.example, and forgotten in the compose
+// file, leaves the container running on a default nobody chose while both
+// documents say otherwise.
+func TestComposePassesEveryVariable(t *testing.T) {
+	passed := composeDefaults(t)
+
+	for _, name := range serviceVariables(t) {
+		// Assembled from the POSTGRES_* values rather than defaulted, so it is
+		// deliberately not of the shape this test reads.
+		if name == "DATABASE_URL" {
+			continue
+		}
+
+		require.Containsf(t, passed, name, "%s is read by Load but not passed to the container", name)
 	}
 }
