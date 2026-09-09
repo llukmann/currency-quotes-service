@@ -105,6 +105,11 @@ func run() error {
 		MaxAttempts:  cfg.WorkerMaxAttempts,
 	}, logger)
 
+	cleanup := worker.NewCleanup(repo, worker.CleanupSettings{
+		Interval: cfg.IdempotencyCleanupInterval,
+		TTL:      cfg.IdempotencyTTL,
+	}, logger)
+
 	srv := &http.Server{
 		Addr:         net.JoinHostPort("", strconv.Itoa(cfg.HTTPPort)),
 		Handler:      api.NewRouter(svc, logger, cfg.HandlerTimeout()),
@@ -140,6 +145,8 @@ func run() error {
 	}
 
 	g.Go(func() error { return recovery.Run(ctx) })
+
+	g.Go(func() error { return cleanup.Run(ctx) })
 
 	g.Go(func() error {
 		<-ctx.Done()

@@ -15,6 +15,7 @@ const (
 	codeInvalidPair    = "invalid_pair"
 	codeInvalidRequest = "invalid_request"
 	codeNotFound       = "not_found"
+	codeKeyConflict    = "key_conflict"
 	codeInternalError  = "internal_error"
 )
 

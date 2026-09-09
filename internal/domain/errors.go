@@ -15,6 +15,13 @@ var (
 	// never been quoted alike.
 	ErrNotFound = errors.New("not found")
 
+	// ErrKeyConflict reports an idempotency key already bound to a task for a
+	// different pair. The request itself is well formed -- what objects is the
+	// history, so the API answers 409 rather than 400, and returning the bound
+	// task instead would hand the client an update of a pair it never asked
+	// for.
+	ErrKeyConflict = errors.New("idempotency key already used with a different pair")
+
 	// ErrStaleClaim reports that the task is no longer held by the caller: the
 	// recovery pass released or closed it, and another worker may have claimed
 	// it since. Whatever the caller fetched has to be discarded -- the task did

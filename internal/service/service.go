@@ -3,10 +3,9 @@
 // It is deliberately thin. Two of its three methods do one thing the handlers
 // must not be trusted with -- turn a string from a client into a validated
 // domain.Pair -- and the third is a lookup that exists so that every handler
-// reaches storage the same way. The layer earns its keep in step 6, where
-// posting an update grows an idempotency key, a lookup of it and a conflicting
-// insert; putting it in now is what keeps the handlers from being rewritten
-// then.
+// reaches storage the same way. Posting an update then carries an idempotency
+// key through to storage, which is where a key is answered: the ordering that
+// matters, parsing the pair before anything compares one, lives here.
 //
 // Nothing here contacts the rate provider. Posting an update queues a task and
 // signals a worker; both reads answer from the database alone.
@@ -25,7 +24,7 @@ import (
 // declares its own, narrower set for the same reason: the two have no method
 // in common, since one drains the queue and the other only fills and reads it.
 type repository interface {
-	CreateTask(ctx context.Context, pair domain.Pair) (domain.UpdateTask, error)
+	CreateTask(ctx context.Context, pair domain.Pair, key *uuid.UUID) (domain.UpdateTask, error)
 	GetTask(ctx context.Context, id uuid.UUID) (domain.TaskDetails, error)
 	GetLatestQuote(ctx context.Context, pair domain.Pair) (domain.Quote, error)
 }
@@ -60,13 +59,22 @@ func New(repo repository, wake chan<- struct{}) *Service {
 // the currency at fault and is written to be read by a client, which is what
 // the handler serves as the message of an invalid_pair; wrapping it here would
 // prepend an operation name that means nothing outside this process.
-func (s *Service) CreateTask(ctx context.Context, pair string) (domain.UpdateTask, error) {
+//
+// key is the client's Idempotency-Key, or nil if it sent none. It is passed
+// on rather than acted on here: what a key means is a question about rows --
+// which one it is bound to, and whether that binding still exists -- and the
+// answer is arbitrated by a constraint rather than by anything this layer could
+// check. Parsing comes first all the same, so that the pair a key is compared
+// against is the normalised one and "eur/mxn" does not conflict with "EUR/MXN".
+//
+// Returns domain.ErrKeyConflict if the key was used before with another pair.
+func (s *Service) CreateTask(ctx context.Context, pair string, key *uuid.UUID) (domain.UpdateTask, error) {
 	p, err := domain.ParsePair(pair)
 	if err != nil {
 		return domain.UpdateTask{}, err
 	}
 
-	task, err := s.repo.CreateTask(ctx, p)
+	task, err := s.repo.CreateTask(ctx, p, key)
 	if err != nil {
 		return domain.UpdateTask{}, err
 	}
@@ -74,7 +82,13 @@ func (s *Service) CreateTask(ctx context.Context, pair string) (domain.UpdateTas
 	// After the row exists, never before: a worker woken by this signal claims
 	// from the table, so a signal sent ahead of the insert would find nothing
 	// and be spent.
-	s.notify()
+	//
+	// Only for a task actually waiting to be claimed. Deduplication and key
+	// replays answer with tasks in every status, and a task already in progress
+	// or long finished gives a woken worker nothing to do.
+	if task.Status == domain.StatusPending {
+		s.notify()
+	}
 
 	return task, nil
 }
