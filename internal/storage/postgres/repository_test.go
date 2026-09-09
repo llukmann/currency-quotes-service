@@ -44,8 +44,16 @@ func TestMain(m *testing.M) {
 	dsn = url
 
 	if url == "" {
-		// Nothing to connect to and nothing to complain about: each test says
-		// so for itself and skips.
+		// Said out loud, on stderr, because the alternative is a run that
+		// looks complete and is not: the skips below are invisible without
+		// -v, and `go test ./...` prints ok for this package either way --
+		// while the tests it skipped are the only ones that ever execute the
+		// SQL. One line, once per package, in the output of a plain run.
+		fmt.Fprintf(os.Stderr,
+			"%s is not set: the storage tests are SKIPPED and no SQL is exercised.\n"+
+				"Point it at a database of its own to run them, see .env.example.\n",
+			testDatabaseURL)
+
 		os.Exit(m.Run())
 	}
 
