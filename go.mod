@@ -3,6 +3,7 @@ module github.com/llukmann/currency-quotes-service
 go 1.26.7
 
 require (
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/go-chi/chi/v5 v5.3.2
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0

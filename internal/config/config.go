@@ -181,29 +181,17 @@ func Load() (Config, error) {
 // CheckTimeouts rejects a combination of settings that cannot hold together, so
 // that the service refuses to start rather than misbehave later: a write
 // timeout with no room for a handler deadline under it would leave requests
-// unbounded, a task deadline too short for a full retry schedule would cut the
-// provider off halfway through every slow call, and a staleness threshold too
-// close to that deadline would have the recovery pass take tasks away from
-// workers that are still working on them, and a sweep of idempotency keys
-// rarer than the lifetime it is there to enforce would quietly multiply it.
+// unbounded, a staleness threshold too close to the task deadline would have
+// the recovery pass take tasks away from workers that are still working on
+// them, and a sweep of idempotency keys rarer than the lifetime it is there to
+// enforce would quietly multiply it.
 //
-// providerBudget is the longest a single provider call can take, retries and
-// backoff included. It is passed in rather than worked out here so that this
-// package depends on nothing of its own: the formula belongs to the package
-// that owns the retry schedule, and the caller that builds a provider is
-// holding both. Load does not call this -- main does, once, right after it.
-func (c Config) CheckTimeouts(providerBudget time.Duration) error {
+// Load does not call this -- main does, once, right after it.
+func (c Config) CheckTimeouts() error {
 	if c.HTTPWriteTimeout <= handlerTimeoutMargin {
 		return fmt.Errorf(
 			"HTTP_WRITE_TIMEOUT: %s leaves nothing above the %s reserved for writing the answer",
 			c.HTTPWriteTimeout, handlerTimeoutMargin,
-		)
-	}
-
-	if c.WorkerTaskTimeout <= providerBudget {
-		return fmt.Errorf(
-			"WORKER_TASK_TIMEOUT: %s does not cover the provider budget of %s, leaving nothing for the finalising transaction",
-			c.WorkerTaskTimeout, providerBudget,
 		)
 	}
 

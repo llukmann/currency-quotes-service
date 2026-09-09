@@ -13,18 +13,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestConfigCheckTimeouts pins the four invariants the service refuses to
+// TestConfigCheckTimeouts pins the three invariants the service refuses to
 // start without. They are worth a test of their own now that Load no longer
 // runs them: the check is one call in main away from being forgotten, and it is
 // cheap to state here what it must reject. The numbers are the configured
 // defaults, so a change to them shows up as a failure with a name on it.
 func TestConfigCheckTimeouts(t *testing.T) {
 	tests := []struct {
-		name           string
-		writeTimeout   time.Duration
-		providerBudget time.Duration
-		taskTimeout    time.Duration
-		stuckTimeout   time.Duration
+		name         string
+		writeTimeout time.Duration
+		taskTimeout  time.Duration
+		stuckTimeout time.Duration
 		// The sweep of idempotency keys and the lifetime it enforces. Left at
 		// zero by every case that is about one of the other three rules, which
 		// the fixture then fills with a valid pair: a case states the rule it
@@ -36,68 +35,44 @@ func TestConfigCheckTimeouts(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:           "the configured defaults hold",
-			writeTimeout:   10 * time.Second,
-			providerBudget: 9900 * time.Millisecond,
-			taskTimeout:    15 * time.Second,
-			stuckTimeout:   time.Minute,
+			name:         "the configured defaults hold",
+			writeTimeout: 10 * time.Second,
+			taskTimeout:  15 * time.Second,
+			stuckTimeout: time.Minute,
 		},
 		{
 			// Equal leaves a handler deadline of zero, which time.Context
 			// treats as already expired rather than as unlimited.
-			name:           "a write timeout equal to the margin leaves no deadline",
-			writeTimeout:   handlerTimeoutMargin,
-			providerBudget: 5 * time.Second,
-			taskTimeout:    15 * time.Second,
-			stuckTimeout:   time.Minute,
-			wantErr:        "HTTP_WRITE_TIMEOUT",
+			name:         "a write timeout equal to the margin leaves no deadline",
+			writeTimeout: handlerTimeoutMargin,
+			taskTimeout:  15 * time.Second,
+			stuckTimeout: time.Minute,
+			wantErr:      "HTTP_WRITE_TIMEOUT",
 		},
 		{
-			name:           "the smallest write timeout above the margin is accepted",
-			writeTimeout:   handlerTimeoutMargin + time.Millisecond,
-			providerBudget: 5 * time.Second,
-			taskTimeout:    15 * time.Second,
-			stuckTimeout:   time.Minute,
+			name:         "the smallest write timeout above the margin is accepted",
+			writeTimeout: handlerTimeoutMargin + time.Millisecond,
+			taskTimeout:  15 * time.Second,
+			stuckTimeout: time.Minute,
 		},
 		{
-			name:           "a deadline shorter than the budget is refused",
-			writeTimeout:   10 * time.Second,
-			providerBudget: 10 * time.Second,
-			taskTimeout:    9 * time.Second,
-			stuckTimeout:   time.Minute,
-			wantErr:        "WORKER_TASK_TIMEOUT",
+			name:         "a staleness threshold without a margin is refused",
+			writeTimeout: 10 * time.Second,
+			taskTimeout:  15 * time.Second,
+			stuckTimeout: 29 * time.Second,
+			wantErr:      "WORKER_STUCK_TIMEOUT",
 		},
 		{
-			// Equal is not enough: the deadline covers the finalising
-			// transaction as well as the call.
-			name:           "a deadline equal to the budget leaves nothing for the commit",
-			writeTimeout:   10 * time.Second,
-			providerBudget: 10 * time.Second,
-			taskTimeout:    10 * time.Second,
-			stuckTimeout:   time.Minute,
-			wantErr:        "WORKER_TASK_TIMEOUT",
-		},
-		{
-			name:           "a staleness threshold without a margin is refused",
-			writeTimeout:   10 * time.Second,
-			providerBudget: 5 * time.Second,
-			taskTimeout:    15 * time.Second,
-			stuckTimeout:   29 * time.Second,
-			wantErr:        "WORKER_STUCK_TIMEOUT",
-		},
-		{
-			name:           "twice the deadline is the smallest margin accepted",
-			writeTimeout:   10 * time.Second,
-			providerBudget: 5 * time.Second,
-			taskTimeout:    15 * time.Second,
-			stuckTimeout:   30 * time.Second,
+			name:         "twice the deadline is the smallest margin accepted",
+			writeTimeout: 10 * time.Second,
+			taskTimeout:  15 * time.Second,
+			stuckTimeout: 30 * time.Second,
 		},
 		{
 			// Equal is already wrong: the sweep is the only thing that ends a
 			// binding, so an interval that matches the lifetime doubles it.
 			name:            "a sweep as rare as the lifetime it enforces is refused",
 			writeTimeout:    10 * time.Second,
-			providerBudget:  5 * time.Second,
 			taskTimeout:     15 * time.Second,
 			stuckTimeout:    time.Minute,
 			cleanupInterval: time.Hour,
@@ -107,7 +82,6 @@ func TestConfigCheckTimeouts(t *testing.T) {
 		{
 			name:            "the configured sweep and lifetime hold",
 			writeTimeout:    10 * time.Second,
-			providerBudget:  5 * time.Second,
 			taskTimeout:     15 * time.Second,
 			stuckTimeout:    time.Minute,
 			cleanupInterval: defaultIdempotencyCleanupInterval,
@@ -127,7 +101,7 @@ func TestConfigCheckTimeouts(t *testing.T) {
 				IdempotencyTTL:             cmp.Or(tt.idempotencyTTL, time.Hour),
 			}
 
-			err := cfg.CheckTimeouts(tt.providerBudget)
+			err := cfg.CheckTimeouts()
 
 			if tt.wantErr == "" {
 				require.NoError(t, err)
@@ -250,11 +224,8 @@ func TestLoadDefaults(t *testing.T) {
 	require.Equal(t, defaultIdempotencyCleanupInterval, cfg.IdempotencyCleanupInterval)
 
 	// The defaults have to survive the checks the service starts with, or an
-	// empty environment is one the service refuses to run in. The budget is
-	// written out rather than imported from the provider package, which this
-	// one deliberately does not depend on; the figure is the one pinned by
-	// TestBudget there, for these same three defaults.
-	require.NoError(t, cfg.CheckTimeouts(9900*time.Millisecond))
+	// empty environment is one the service refuses to run in.
+	require.NoError(t, cfg.CheckTimeouts())
 }
 
 // TestLoadReadsEveryVariableIntoItsOwnField is what eighteen near-identical
