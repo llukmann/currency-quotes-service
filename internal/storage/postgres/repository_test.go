@@ -35,8 +35,14 @@ const testDatabaseURL = "TEST_DATABASE_URL"
 // each starts from an empty schema.
 var pool *pgxpool.Pool
 
+// dsn is the connection string the pool was opened from, kept for the tests
+// that open a connection of their own rather than borrowing this one.
+var dsn string
+
 func TestMain(m *testing.M) {
 	url := os.Getenv(testDatabaseURL)
+	dsn = url
+
 	if url == "" {
 		// Nothing to connect to and nothing to complain about: each test says
 		// so for itself and skips.
@@ -1115,4 +1121,187 @@ func today() time.Time {
 	now := time.Now().UTC()
 
 	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+// TestRepositoryReportsAFailingDatabaseAsItself is about what a caller is told
+// when the statement never ran at all.
+//
+// Every method here has a second answer that is not an error: no such row, or
+// the claim is no longer yours. Both are read from what the database returned,
+// so both are only meaningful once it returned something -- and the layers
+// above act on them. ErrNotFound becomes a 404, telling a client to stop
+// asking about an update that does exist. ErrStaleClaim makes a worker discard
+// a rate it has already fetched, at warning level, as though somebody else had
+// taken the task.
+//
+// A cancelled context is the cheapest way to have every statement fail without
+// touching the database, and it fails them all at the same place: before the
+// query is sent.
+func TestRepositoryReportsAFailingDatabaseAsItself(t *testing.T) {
+	repo := newRepo(t)
+
+	// Built while the context still works, so the calls below fail for the one
+	// reason under test rather than for want of a row.
+	task := createTask(t, repo, "EUR/MXN", nil)
+	claim := claimTask(t, repo)
+	key := uuid.New()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	tests := []struct {
+		name string
+		call func(ctx context.Context) error
+	}{
+		{
+			name: "creating a task",
+			call: func(ctx context.Context) error {
+				_, err := repo.CreateTask(ctx, domain.Pair("USD/MXN"), nil)
+
+				return err
+			},
+		},
+		{
+			name: "creating a task with a key",
+			call: func(ctx context.Context) error {
+				_, err := repo.CreateTask(ctx, domain.Pair("USD/MXN"), &key)
+
+				return err
+			},
+		},
+		{
+			// Called past the lookup that answers a repeat, so that the
+			// transaction itself is what fails: with a key, the read above
+			// comes first and would otherwise be the only thing this reaches.
+			name: "creating a task inside the key transaction",
+			call: func(ctx context.Context) error {
+				_, err := repo.createTaskWithKey(ctx, domain.Pair("USD/MXN"), key)
+
+				return err
+			},
+		},
+		{
+			name: "reading a task",
+			call: func(ctx context.Context) error {
+				_, err := repo.GetTask(ctx, task.ID)
+
+				return err
+			},
+		},
+		{
+			name: "reading the latest quote",
+			call: func(ctx context.Context) error {
+				_, err := repo.GetLatestQuote(ctx, domain.Pair("EUR/MXN"))
+
+				return err
+			},
+		},
+		{
+			name: "claiming a task",
+			call: func(ctx context.Context) error {
+				_, _, err := repo.ClaimTask(ctx)
+
+				return err
+			},
+		},
+		{
+			name: "completing a task",
+			call: func(ctx context.Context) error {
+				return repo.CompleteTask(ctx, claim, decimal.RequireFromString("19.6552"), today(), time.Now())
+			},
+		},
+		{
+			name: "failing a task",
+			call: func(ctx context.Context) error {
+				return repo.FailTask(ctx, claim, "provider unavailable after 3 attempts")
+			},
+		},
+		{
+			name: "releasing a task",
+			call: func(ctx context.Context) error {
+				return repo.ReleaseTask(ctx, claim)
+			},
+		},
+		{
+			name: "releasing stuck tasks",
+			call: func(ctx context.Context) error {
+				_, _, err := repo.ReleaseStuckTasks(ctx, time.Minute, 3, "abandoned")
+
+				return err
+			},
+		},
+		{
+			name: "deleting expired keys",
+			call: func(ctx context.Context) error {
+				_, err := repo.DeleteExpiredKeys(ctx, time.Hour)
+
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.call(ctx)
+
+			require.Error(t, err)
+			require.ErrorIs(t, err, context.Canceled)
+
+			// None of the three may stand in for a database that did not
+			// answer: each of them is a fact about a row, and no row was read.
+			require.NotErrorIs(t, err, domain.ErrNotFound)
+			require.NotErrorIs(t, err, domain.ErrStaleClaim)
+			require.NotErrorIs(t, err, domain.ErrKeyConflict)
+		})
+	}
+
+	// Nothing was decided about the task either: it is still held by the claim
+	// whose finalisation could not be sent.
+	require.Equal(t, domain.StatusInProgress, taskByID(t, claim.ID).Status)
+}
+
+// TestCompleteTaskRollsBackARefusedQuote checks the finalising transaction from
+// the side the happy path cannot show. The task is closed first and the quote
+// inserted second, so an insert the column refuses has to take the closure with
+// it -- otherwise the task reads done while no rate exists, and
+// GET /quotes/updates/{id} answers with a completed update carrying nothing.
+//
+// The rate below is one the provider would never pass on; the constraint is the
+// backstop behind that, and this is the only test that asks it anything.
+func TestCompleteTaskRollsBackARefusedQuote(t *testing.T) {
+	repo := newRepo(t)
+
+	createTask(t, repo, "EUR/MXN", nil)
+	claim := claimTask(t, repo)
+
+	err := repo.CompleteTask(t.Context(), claim, decimal.Zero, today(), time.Now())
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, domain.ErrStaleClaim)
+
+	require.Equal(t, domain.StatusInProgress, taskByID(t, claim.ID).Status, "the task was closed without a rate")
+	require.Zero(t, countRows(t, "quotes"))
+}
+
+// TestReplayByKeyWithoutABinding covers the branch the code calls unreachable.
+// It is reached only if the sweep removed a binding between the conflict that
+// found it and the read that follows, which needs the binding to have been past
+// its lifetime already when it was written.
+//
+// Called directly rather than raced into, since what is worth pinning is not
+// how to get there but what happens: it is reported, because it would mean the
+// sweep and the insert disagree about what exists. Answered as a conflict it
+// would tell a client its key belonged to another pair, and answered as success
+// it would hand back an empty task.
+func TestReplayByKeyWithoutABinding(t *testing.T) {
+	repo := newRepo(t)
+
+	key := uuid.New()
+
+	task, err := repo.replayByKey(t.Context(), key, domain.Pair("EUR/MXN"))
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, key.String())
+	require.NotErrorIs(t, err, domain.ErrKeyConflict)
+	require.Empty(t, task)
 }
