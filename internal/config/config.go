@@ -181,9 +181,7 @@ func (c Config) check() error {
 	return nil
 }
 
-// Derived rather than configured: it has to stay strictly under
-// HTTP_WRITE_TIMEOUT, and a variable of its own would let the two be set the
-// wrong way round. check is what guarantees the result is positive.
+// Has to stay strictly under HTTP_WRITE_TIMEOUT, which check is what guarantees.
 func (c Config) HandlerTimeout() time.Duration {
 	return c.HTTPWriteTimeout - handlerTimeoutMargin
 }

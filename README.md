@@ -7,8 +7,7 @@ An asynchronous currency quotes service in Go.
 A client never fetches a rate directly. It posts an update, which is queued and
 answered at once with an identifier, while a background worker performs the
 refresh; the two read endpoints answer from the database alone. There is no
-synchronous way to obtain a fresh rate — that is the point of the contract, not
-a limitation of it.
+synchronous way to obtain a fresh rate.
 
 Rates come from [frankfurter.dev](https://frankfurter.dev), which needs no API
 key and no account. That is why the stack below starts with no configuration of
@@ -178,8 +177,8 @@ go test ./...
 On a clean clone this is green, and it does not cover the SQL. The storage tests
 — the only ones that exercise `SKIP LOCKED`, the partial indexes, the
 transactions and the `numeric` round trip — skip themselves unless
-`TEST_DATABASE_URL` names a database to run against. Go prints `ok` for a
-package whose tests all skipped, so a green run says less than it looks like.
+`TEST_DATABASE_URL` names a database to run against, and Go prints `ok` for a
+package whose tests all skipped.
 
 To run them, give them a database of their own. They truncate every table
 between cases, so it must not be the one the service is using:
@@ -225,9 +224,8 @@ binding, the lookup stops seeing it, and the next post carrying that key takes
 the row over.
 
 **Rates are `numeric` in the database and strings on the wire.** `float64` is
-absent from the path a rate travels. A JSON number would be parsed into a float
-by most clients, and a rate that survives that round trip intact is a
-coincidence.
+absent from the path a rate travels: most clients parse a JSON number into one,
+and ten decimal places do not survive it.
 
 **The spec comes first and the transport is generated from it.**
 `internal/api/contract` is produced from `api/openapi.yaml` by `oapi-codegen`,
@@ -253,9 +251,10 @@ existed to enforce the lifetime rather than to reclaim space — the lifetime no
 lives in the query. In production this belongs outside the application: a
 scheduled `DELETE`, or a partition to drop.
 
-**The service layer is thin.** After parsing moved to the boundary, two of its
-three methods are one-line calls into storage; what is left is the wake-up
-signal and a seam that keeps handlers out of the repository.
+**The service layer holds the wake-up signal and nothing else it did not need
+to.** Parsing belongs at the boundary and storage belongs behind it, so two of
+its three methods are one-line calls; the layer is there for the seam and for
+queueing a task and waking a worker as one step.
 
 **No authentication, rate limiting, pagination or metrics.** None are in the
 assignment, and each would be more surface than three endpoints have.

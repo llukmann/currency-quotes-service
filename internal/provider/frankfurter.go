@@ -39,10 +39,9 @@ type Client struct {
 
 var _ RateProvider = (*Client)(nil)
 
-// The client is built here rather than taken as an argument so that
-// http.DefaultClient cannot be passed by accident: it has no timeout at all, so
-// an upstream that accepts a connection and then says nothing would hold a
-// worker for the whole task budget instead of failing and being retried.
+// Built here so that it always carries a timeout: without one, an upstream that
+// accepts a connection and then says nothing holds a worker for the whole task
+// budget.
 func NewClient(baseURL string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL: strings.TrimSuffix(baseURL, "/"),

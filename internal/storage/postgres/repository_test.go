@@ -41,7 +41,7 @@ func TestMain(m *testing.M) {
 		// SQL. One line, once per package, in the output of a plain run.
 		fmt.Fprintf(os.Stderr,
 			"%s is not set: the storage tests are SKIPPED and no SQL is exercised.\n"+
-				"Point it at a database of its own to run them, see .env.example.\n",
+				"Point it at a database of its own to run them, see the Tests section of README.md.\n",
 			testDatabaseURL)
 
 		os.Exit(m.Run())
@@ -70,7 +70,7 @@ func TestMain(m *testing.M) {
 	if err := requireSchema(ctx, p); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"%s is set but the schema is not there: %v\n"+
-				"Apply the migrations to it first, see .env.example.\n",
+				"Apply the migrations to it first, see the Tests section of README.md.\n",
 			testDatabaseURL, err)
 		os.Exit(1)
 	}

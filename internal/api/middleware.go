@@ -46,9 +46,7 @@ func requestIDFrom(ctx context.Context) string {
 // lets this line stay at info for every status. A status of zero means the
 // handler wrote nothing at all.
 //
-// The writer is wrapped so the status can be read back. chi's wrapper rather
-// than ours: a hand-rolled one is a dozen lines, and they are exactly the dozen
-// where the pass-through of Flush and ReaderFrom is got wrong.
+// The writer is wrapped so the status can be read back.
 func accessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -76,10 +74,6 @@ func accessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 // The server's write timeout ends the response but does not cancel the request,
 // so without this a query against a stopped database holds a goroutine and a
 // pooled connection for the length of the outage.
-//
-// Not chi's middleware.Timeout: that answers with a bare 504, which the spec
-// lists for no endpoint, and writes it without checking whether the handler has
-// already answered.
 func requestTimeout(d time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
