@@ -6,9 +6,13 @@ An asynchronous currency quotes service in Go.
 
 A client never fetches a rate directly. It posts an update, which is queued and
 answered at once with an identifier, while a background worker performs the
-refresh against an upstream provider; the two read endpoints answer from the
-database alone. There is no synchronous way to obtain a fresh rate — that is the
-point of the contract, not a limitation of it.
+refresh; the two read endpoints answer from the database alone. There is no
+synchronous way to obtain a fresh rate — that is the point of the contract, not
+a limitation of it.
+
+Rates come from [frankfurter.dev](https://frankfurter.dev), which needs no API
+key and no account. That is why the stack below starts with no configuration of
+any kind.
 
 Supported currencies are USD, EUR and MXN. A pair is written `BASE/QUOTE`, and a
 rate says how many units of the quote currency one unit of the base currency
@@ -22,8 +26,7 @@ Requires Docker. Nothing else — no local Go, no database, no `.env`.
 docker compose up --build
 ```
 
-That starts PostgreSQL, applies the migrations, and starts the service on
-`localhost:8080`.
+That starts PostgreSQL, applies the migrations, and serves on `localhost:8080`.
 
 The full scenario, from an empty database to a stored rate:
 
@@ -52,6 +55,22 @@ curl -s 'localhost:8080/quotes/latest?pair=EUR/MXN'
 A refresh usually completes in under a second: posting the task also wakes a
 worker, rather than leaving it to the next poll of the queue.
 
+To stop and remove the database volume with it:
+
+```
+docker compose down -v
+```
+
+## Where things are
+
+| Asked for | Where |
+| --- | --- |
+| Unit tests | [Tests](#tests) — `go test ./...` |
+| Containerisation | `docker-compose.yml`, `Dockerfile` |
+| Idempotent updates | `Idempotency-Key` on `POST`, see [Design decisions](#design-decisions) |
+| OpenAPI specification | [`api/openapi.yaml`](api/openapi.yaml) |
+| Database schema | [`migrations/`](migrations) |
+
 ## API
 
 The contract is [`api/openapi.yaml`](api/openapi.yaml) — request and response
@@ -79,30 +98,27 @@ business API and is not described in the spec.
 ## How it works
 
 ```
-POST /quotes/updates ──> quote_updates (pending) ──> [ wake ]
-                                                        │
-                          worker: claim ──> provider ──> quotes + status=done
-                                                        │
-GET /quotes/updates/{id} ─┐                             │
-GET /quotes/latest?pair=  ┴──> read from the database ──┘
+POST /quotes/updates    ->  row in quote_updates (pending)  ->  202 with update_id
+        a worker        ->  claims it, calls the provider, writes quotes, done
+GET /quotes/updates/{id}
+GET /quotes/latest      ->  read from the database, never from the provider
 ```
 
-The handler writes a row and returns. It never contacts the provider, and the
-read endpoints never do either — everything a client is told comes out of the
+The handler writes a row and returns. It holds no path to the provider at all,
+and neither do the read endpoints — everything a client is told comes out of the
 database.
 
 Workers claim tasks with `SELECT ... FOR UPDATE SKIP LOCKED`, so several of them
 drain one queue without waiting on each other. A claim also increments
 `attempts`, which doubles as the token that makes finalisation safe: a worker
-whose task was taken away by the recovery pass cannot overwrite the result of
-whoever has it now.
+whose task was taken away cannot overwrite the result of whoever has it now.
+Finishing a task writes the quote and moves the status in one transaction, so
+there is no state in which a rate is stored but the task still looks unfinished.
 
-Finishing a task writes the quote and moves the status in one transaction. There
-is no state in which a rate is stored but the task still looks unfinished.
-
-A separate pass returns tasks that have been `in_progress` for too long — a
-process killed mid-task leaves one behind — and gives up on a task that has been
-claimed too many times, closing it as `failed`.
+A second background pass returns tasks that have been `in_progress` for too long
+— a process killed mid-task leaves one behind — and gives up on a task claimed
+`WORKER_MAX_ATTEMPTS` times, closing it as `failed` rather than releasing it
+forever.
 
 Two things deduplicate a post, and they cover different windows. A partial
 unique index allows at most one unfinished task per pair, so a burst of requests
@@ -119,9 +135,9 @@ truth for the schema.
 the number of times it was claimed, and the reason it failed. A `CHECK`
 constraint refuses a `failed` row with no reason. Two partial indexes serve the
 queue — pending tasks by age, running tasks by when they were claimed — and a
-partial unique index on `pair` enforces the deduplication described above.
-Terminal rows fall outside all three, so history never slows the queue down or
-blocks a new task.
+partial unique index on `pair` enforces the deduplication above. Terminal rows
+fall outside all three, so history never slows the queue down or blocks a new
+task.
 
 `quotes` holds what a completed task produced: the rate as `numeric(20,10)`, the
 day it is valid for, and when this service received it. Its primary key is the
@@ -131,20 +147,23 @@ latest rate for a pair does not have to join.
 `idempotency_keys` maps a key to the task it was answered with. Several keys can
 point at one task, which is why it is a table rather than a column.
 
-## Running without compose
+## Running the binary against the compose database
 
-The service does not apply migrations itself; the `migrate` service in
-`docker-compose.yml` does. To run the binary against the compose database:
+Needs Go 1.26. The database and the migrations still come from compose — the
+service does not apply migrations itself.
 
-```powershell
+```bash
 docker compose up -d postgres
-docker compose run --rm migrate   # arguments already in docker-compose.yml
-$env:DATABASE_URL = "postgres://quotes:quotes@localhost:5432/quotes?sslmode=disable"
+docker compose run --rm migrate          # arguments already in docker-compose.yml
+export DATABASE_URL='postgres://quotes:quotes@localhost:5432/quotes?sslmode=disable'
 go run .
 ```
 
+In PowerShell the only line that differs is the variable:
+`$env:DATABASE_URL = "postgres://quotes:quotes@localhost:5432/quotes?sslmode=disable"`
+
 Configuration is read from the environment. `DATABASE_URL` is the only variable
-without a default; the rest are listed with their defaults in
+without a default; the rest are listed with theirs in
 [`.env.example`](.env.example).
 
 ## Tests
@@ -162,23 +181,21 @@ package whose tests all skipped, so a green run says less than it looks like.
 To run them, give them a database of their own. They truncate every table
 between cases, so it must not be the one the service is using:
 
-```powershell
+```bash
 docker compose exec postgres createdb -U quotes quotes_test
-docker compose run --rm migrate -path=/migrations `
-  -database "postgres://quotes:quotes@postgres:5432/quotes_test?sslmode=disable" up
-$env:TEST_DATABASE_URL = "postgres://quotes:quotes@localhost:5432/quotes_test?sslmode=disable"
+docker compose run --rm migrate -path=/migrations -database "postgres://quotes:quotes@postgres:5432/quotes_test?sslmode=disable" up
+export TEST_DATABASE_URL='postgres://quotes:quotes@localhost:5432/quotes_test?sslmode=disable'
 go test ./...
 ```
+
+In PowerShell, again, only the variable differs:
+`$env:TEST_DATABASE_URL = "postgres://quotes:quotes@localhost:5432/quotes_test?sslmode=disable"`
 
 CI runs exactly this on every pull request, plus `go test -race ./...` against
 the same database, `golangci-lint`, a check that the generated contract still
 matches the spec, and a build of the service image.
 
 ## Design decisions
-
-**The asynchronous contract is enforced, not just offered.** The POST handler
-writes a row and returns; it holds no path to the provider at all. A rate a
-client is shown has been through the database.
 
 **A post can be answered with a task it did not create.** At most one unfinished
 task exists per pair, so two clients asking for `EUR/MXN` at the same moment
@@ -210,24 +227,14 @@ or a field changed in one place and not the other stops the build; CI
 regenerates and compares, so the two cannot drift.
 
 **Migrations are applied by compose, not by the binary.** The service waits for
-that step to finish rather than running it, which keeps the schema tool out of
-`go.mod` and out of the runtime image. The cost is that a manual run needs one
-command first, given above.
+that step rather than running it, which keeps the schema tool out of `go.mod`
+and out of the runtime image. The cost is the extra command above.
 
 **The supported currencies live in code, not in configuration.** They are
-bounded by what the upstream provider knows, so a currency added through an
-environment variable would pass validation and then fail every refresh — after
-the request had already been accepted with `202`. A failure that appears only in
-the background is worse than one at the boundary.
-
-**Claiming is a single statement, finalising is a single transaction.**
-`FOR UPDATE SKIP LOCKED` lets the pool scale without a lock convoy, and
-`attempts` acts as a claim token so a stale worker cannot commit over a live one.
-
-**Stuck tasks are recovered rather than left.** A task in progress longer than
-`WORKER_STUCK_TIMEOUT` goes back to the queue; one that has been claimed
-`WORKER_MAX_ATTEMPTS` times is closed as `failed` instead, so a pair the
-provider reliably times out on cannot cycle forever.
+bounded by what the provider knows, so a currency added through an environment
+variable would pass validation and then fail every refresh — after the request
+had already been accepted with `202`. A failure that appears only in the
+background is worse than one at the boundary.
 
 ## Not done on purpose
 
@@ -242,13 +249,13 @@ three methods are one-line calls into storage; what is left is the wake-up
 signal and a seam that keeps handlers out of the repository.
 
 **No authentication, rate limiting, pagination or metrics.** None are in the
-assignment, and each would be more surface than the three endpoints have.
+assignment, and each would be more surface than three endpoints have.
 
 **No Swagger UI.** The page and the API would be different origins, so "Try it
 out" needs CORS headers the service does not serve. The assignment asks for a
 specification file, and that is what `api/openapi.yaml` is.
 
-**One provider, and no tests around `main`.** The upstream is
-[frankfurter.dev](https://frankfurter.dev); swapping it means implementing one
-interface. Process wiring — the order of goroutines in the errgroup, the
-shutdown path — is covered by running the thing, not by a unit test.
+**One provider, and no tests around `main`.** Swapping the upstream means
+implementing one interface. Process wiring — the order of goroutines in the
+errgroup, the shutdown path — is covered by running the thing, not by a unit
+test.
