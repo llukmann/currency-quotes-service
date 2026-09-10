@@ -7,61 +7,49 @@ import (
 	"time"
 )
 
-// reasonAbandoned is stored on a task that has been claimed as often as it is
-// allowed to be and is still not finished. Like the other reasons it names the
-// outcome and not the mechanism: what a client can act on is that this update
-// will not happen, so a new one has to be posted.
+// Names the outcome and not the mechanism: what a client can act on is that
+// this update will not happen, so a new one has to be posted.
 const reasonAbandoned = "abandoned after %d attempts"
 
-// recoveryRepository is the one statement this pass needs. It is separate from
-// the worker's repository because the two have nothing in common: a worker acts
-// on the task it holds, this acts on tasks nobody holds any more.
+// The one statement this pass needs, separate from the worker's repository
+// because the two have nothing in common: a worker acts on the task it holds,
+// this acts on tasks nobody holds any more.
 type recoveryRepository interface {
 	ReleaseStuckTasks(ctx context.Context, olderThan time.Duration, maxAttempts int, reason string) (released, failed int, err error)
 }
 
-// RecoverySettings are the numbers the pass runs by, from the configuration
-// through main.
 type RecoverySettings struct {
-	// Interval is how often the pass runs. It bounds how long a task sits
-	// unattended after its worker died, on top of StuckTimeout.
+	// Bounds how long a task sits unattended after its worker died, on top of
+	// StuckTimeout.
 	Interval time.Duration
-	// StuckTimeout is how long a task may stay in_progress before it counts as
-	// abandoned. It is measured by the database clock against the claim time,
-	// while a worker's deadline is measured by the worker's own process, so
-	// this has to carry a margin over that deadline -- the configuration
-	// refuses to start without one.
+	// Measured by the database clock against the claim time, while a worker's
+	// deadline is measured by the worker's own process, so this has to carry a
+	// margin over that deadline -- the configuration refuses to start without
+	// one.
 	StuckTimeout time.Duration
-	// MaxAttempts is how many claims a task gets before the pass stops
-	// releasing it and closes it as failed instead. Without a limit a task
-	// that reliably kills whoever picks it up would be handed round forever.
+	// Without a limit a task that reliably kills whoever picks it up would be
+	// handed round forever.
 	MaxAttempts int
 }
 
-// Recovery returns tasks that no live worker holds to the queue.
-//
-// Nothing releases them on their own: the row lock a claim takes is gone the
-// moment the claiming transaction commits, so a process that dies afterwards
-// leaves a row that says in_progress and a worker that no longer exists. The
-// database cannot tell those apart from a worker still at work -- it has no
-// such knowledge -- so age is what stands in for it.
+// Nothing releases stuck tasks on their own: the row lock a claim takes is
+// gone the moment the claiming transaction commits, so a process that dies
+// afterwards leaves a row saying in_progress and a worker that no longer
+// exists. The database cannot tell that from a worker still at work, so age
+// stands in for it.
 type Recovery struct {
 	repo     recoveryRepository
 	settings RecoverySettings
 	logger   *slog.Logger
 }
 
-// NewRecovery returns a recovery pass over repo.
 func NewRecovery(repo recoveryRepository, settings RecoverySettings, logger *slog.Logger) *Recovery {
 	return &Recovery{repo: repo, settings: settings, logger: logger}
 }
 
-// Run makes a pass on every tick until ctx is done, which is a shutdown and so
-// returns nil.
-//
-// The first pass waits out an interval rather than running at startup. A task
+// The first pass waits out an interval rather than running at startup: a task
 // left behind by the previous process is not stale until StuckTimeout has
-// passed anyway, and by then the tick will have come round.
+// passed anyway.
 func (r *Recovery) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.settings.Interval)
 	defer ticker.Stop()
@@ -76,11 +64,10 @@ func (r *Recovery) Run(ctx context.Context) error {
 	}
 }
 
-// pass releases what it can and closes what it cannot, reporting the two
-// separately: they say different things about the service. Releases mean
-// workers are dying, or that the threshold is tight enough to be taking tasks
-// from workers that are still alive; an abandonment means one task keeps
-// killing whoever picks it up.
+// The two counts are reported separately because they mean different things:
+// releases say workers are dying, or that the threshold is tight enough to be
+// taking tasks from workers still alive, while an abandonment says one task
+// keeps killing whoever picks it up.
 func (r *Recovery) pass(ctx context.Context) {
 	reason := fmt.Sprintf(reasonAbandoned, r.settings.MaxAttempts)
 

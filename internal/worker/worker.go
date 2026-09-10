@@ -1,10 +1,6 @@
-// Package worker drains the queue of update tasks.
-//
-// This is where the two halves of the service meet: a worker claims a task,
-// asks the provider for the rate and finalises the task in the database. It is
-// also where raw upstream errors stop. The provider reports what happened and
-// whether another attempt could help; deciding what a client is told about it,
-// and what only the log gets to see, belongs here.
+// Package worker drains the queue of update tasks. It is where raw upstream
+// errors stop: deciding what a client is told about a failure, and what only
+// the log sees, belongs here.
 package worker
 
 import (
@@ -25,20 +21,10 @@ import (
 // this service is built. The upstream's own words, its URL and its status code
 // stay in the log.
 const (
-	// reasonUnavailable is for an upstream that never answered -- every
-	// attempt met a network failure, a timeout, a 429 or a 5xx.
-	reasonUnavailable = "provider unavailable after %d attempts"
-	// reasonUnusableResponse is for an upstream that did answer, with
-	// something this service cannot use: a rejected request, a body that does
-	// not parse, a rate that is not a rate. Asking again would produce the
-	// same answer, so it never was.
+	reasonUnavailable      = "provider unavailable after %d attempts"
 	reasonUnusableResponse = "provider returned an unusable response"
 )
 
-// repository is the part of the storage layer this package uses. It is
-// declared here rather than beside the implementation because the consumer is
-// what knows which statements it needs -- and because this is the surface a
-// hand-written mock stands in for.
 type repository interface {
 	ClaimTask(ctx context.Context) (domain.UpdateTask, bool, error)
 	CompleteTask(ctx context.Context, claim domain.UpdateTask, rate decimal.Decimal, rateDate, fetchedAt time.Time) error
@@ -46,41 +32,30 @@ type repository interface {
 	ReleaseTask(ctx context.Context, claim domain.UpdateTask) error
 }
 
-// releaseTimeout bounds handing a claim back on shutdown. That work runs on a
-// context which has already been cancelled and therefore needs a deadline of
-// its own; one UPDATE takes milliseconds, and if even this is not enough the
-// task is not lost -- it stays in progress and the recovery pass has it.
+// Handing a claim back runs on a context that has already been cancelled and
+// therefore needs a deadline of its own. If even this is not enough the task is
+// not lost: it stays in progress and the recovery pass has it.
 const releaseTimeout = 5 * time.Second
 
-// claimFailureReportInterval is how often a worker repeats itself while the
-// queue cannot be reached at all. See Run.
 const claimFailureReportInterval = time.Minute
 
-// rateProvider is the provider as seen from here: one call, no retry policy of
-// its own to expose. Both the bare client and the retrying decorator satisfy
-// it, and a worker cannot tell which one it holds.
+// The provider as seen from here: one call, no retry policy of its own. The
+// retrier is a RateProvider too, so a worker cannot tell whether the rate
+// arrived on the first attempt or the third.
 type rateProvider interface {
 	FetchRate(ctx context.Context, pair domain.Pair) (provider.Rate, error)
 }
 
-// Settings are the numbers a worker runs by. They arrive from the
-// configuration through main: this package neither reads the environment nor
-// knows which variables exist.
+// The numbers arrive from the configuration through main: this package neither
+// reads the environment nor knows which variables exist.
 type Settings struct {
-	// TaskTimeout is the deadline of one task, covering the provider call with
-	// all of its retries and the finalisation after it. The configuration
-	// refuses to start unless it exceeds the provider's own budget.
-	TaskTimeout time.Duration
-	// PollInterval is how long to wait before asking an empty queue again.
+	TaskTimeout  time.Duration
 	PollInterval time.Duration
-	// ProviderAttempts is how many attempts that provider makes. It is here
-	// only to phrase reasonUnavailable: the retrying itself is the provider's
-	// business, and a worker does not count the tries.
+	// Here only to phrase reasonUnavailable: the retrying itself is the
+	// provider's business, and a worker does not count the tries.
 	ProviderAttempts int
 }
 
-// Worker processes tasks one at a time. It holds nothing that changes, so the
-// pool runs several goroutines over a single instance.
 type Worker struct {
 	repo     repository
 	rates    rateProvider
@@ -89,33 +64,20 @@ type Worker struct {
 	logger   *slog.Logger
 }
 
-// New returns a worker reading from repo and rates.
-//
-// wake is the signal that a task has just been posted, shared by the whole
-// pool; see Run. A nil channel is legal and means the worker only polls, which
-// is what the tests of the loop below rely on.
+// A nil wake channel is legal and means the worker only polls.
 func New(repo repository, rates rateProvider, wake <-chan struct{}, settings Settings, logger *slog.Logger) *Worker {
 	return &Worker{repo: repo, rates: rates, wake: wake, settings: settings, logger: logger}
 }
 
-// Run claims and processes tasks until ctx is done, which is a shutdown rather
-// than a failure and so returns nil.
-//
-// A processed task is followed by another claim straight away: the queue is
-// only asked to wait when it turns out to be empty. An idle worker then waits
-// for whichever comes first, the poll interval or a signal that a task has
-// just been posted. The signal is what makes the service feel immediate, and
-// the interval is what makes it correct: a task posted by another process, or
-// one handed back by the recovery pass, has nobody to send the signal, and
-// waiting for it alone would leave such a task sitting until the next post.
+// An idle worker waits for whichever comes first, the poll interval or a signal
+// that a task has just been posted. The signal is what makes the service feel
+// immediate, the interval is what makes it correct: a task posted by another
+// process, or one handed back by the recovery pass, has nobody to signal.
 func (w *Worker) Run(ctx context.Context) error {
-	// A database that is briefly unreachable is not worth stopping the service
-	// for: the loop waits out the interval and asks again. Saying so every time
-	// would bury the incident under its own symptom, since every worker polls --
-	// four of them at a one second interval write four lines a second for as
-	// long as the outage lasts. The first failure is reported, then one a
-	// minute, and the recovery counts what was lost, which is the figure that
-	// says how long it went on.
+	// A briefly unreachable database is not worth stopping for, and saying so
+	// every time would bury the incident under its own symptom: four workers at
+	// a one second interval write four lines a second. First failure, then one
+	// a minute.
 	var failures int
 	var lastReport time.Time
 
@@ -148,9 +110,6 @@ func (w *Worker) Run(ctx context.Context) error {
 	return nil
 }
 
-// claimAndProcess takes the next task, if there is one, and reports whether it
-// found work. Only the claim can fail here: what happens to a claimed task is
-// recorded on the task itself, not returned to the loop.
 func (w *Worker) claimAndProcess(ctx context.Context) (bool, error) {
 	claim, ok, err := w.repo.ClaimTask(ctx)
 	if err != nil || !ok {
@@ -159,8 +118,8 @@ func (w *Worker) claimAndProcess(ctx context.Context) (bool, error) {
 
 	// The deadline starts here rather than at the claim, so it measures the
 	// work and not the wait. The database has been timing the task since the
-	// claim committed, which is part of why its staleness threshold has to
-	// carry a margin over this deadline.
+	// claim committed, which is why its staleness threshold carries a margin
+	// over this deadline.
 	taskCtx, cancel := context.WithTimeout(ctx, w.settings.TaskTimeout)
 	defer cancel()
 
@@ -169,8 +128,6 @@ func (w *Worker) claimAndProcess(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// process drives one claimed task to a terminal status, or leaves it alone for
-// the recovery pass when finalising it would be wrong.
 func (w *Worker) process(ctx context.Context, claim domain.UpdateTask) {
 	log := w.logger.With(
 		slog.String("update_id", claim.ID.String()),
@@ -184,29 +141,24 @@ func (w *Worker) process(ctx context.Context, claim domain.UpdateTask) {
 	// start of a transaction that has not opened yet.
 	fetchedAt := time.Now().UTC()
 
-	// Asked of the context rather than of the error, because the two cannot be
-	// told apart by looking at what came back: an attempt that hit the
+	// Asked of the context rather than of the error: an attempt that hit the
 	// provider's own timeout wraps context.DeadlineExceeded just as a task
-	// whose deadline ran out does.
-	//
-	// Either way nothing can be written with a context that is done, and which
-	// of the two it was decides what happens to the task.
+	// whose deadline ran out does, so the two cannot be told apart by what came
+	// back.
 	if err := ctx.Err(); err != nil {
 		if errors.Is(err, context.Canceled) {
-			// The service is shutting down. The task did not fail -- we are the
-			// ones leaving -- so the claim goes back and the next process finds
-			// the task queued rather than waiting out the staleness threshold.
+			// We are the ones leaving, so the claim goes back and the next
+			// process finds the task queued rather than waiting out the
+			// staleness threshold.
 			w.release(ctx, log, claim)
 
 			return
 		}
 
-		// The deadline ran out. Left in progress on purpose: released here it
-		// would be claimed again at once, and a pair the upstream reliably
-		// takes too long over would cycle between claim and release forever,
-		// always too fresh for the recovery pass to give up on. Leaving it
-		// makes it stale, and staleness is what the attempt limit is counted
-		// against.
+		// Left in progress on purpose: released here it would be claimed again
+		// at once, and a pair that reliably times out would cycle forever,
+		// always too fresh for the recovery pass. Leaving it makes it stale,
+		// which is what the attempt limit is counted against.
 		log.Warn("task deadline exceeded, left in progress",
 			slog.Any("error", err),
 			slog.Any("provider_error", fetchErr),
@@ -233,8 +185,6 @@ func (w *Worker) process(ctx context.Context, claim domain.UpdateTask) {
 	)
 }
 
-// fail closes a task the provider could not answer, storing the normalised
-// reason and logging the raw one.
 func (w *Worker) fail(ctx context.Context, log *slog.Logger, claim domain.UpdateTask, fetchErr error) {
 	reason := w.failureReason(fetchErr)
 
@@ -247,19 +197,11 @@ func (w *Worker) fail(ctx context.Context, log *slog.Logger, claim domain.Update
 	}
 }
 
-// finalisationFailed deals with a finalising statement that did not go
-// through, whichever of the two it was.
-//
-// A lost claim is the end of it: the task belongs to someone else, and what
-// this worker was about to record about it is void.
-//
-// Anything else leaves the task in progress, and then it matters why. A
-// cancelled context means the write failed because the service is shutting
-// down, which is the same situation as a cancellation during the provider call
-// and deserves the same answer: the claim goes back. Releasing is safe even if
-// the finalisation did commit and only its answer was lost -- ReleaseTask
-// matches on status and on the claim token, so a task already closed is left
-// alone and reported as a stale claim.
+// A lost claim is the end of it: what this worker was about to record is void.
+// Anything else leaves the task in progress, and a cancelled context means the
+// service is shutting down, so the claim goes back -- safe even if the
+// finalisation did commit and only its answer was lost, since ReleaseTask
+// matches on status and on the claim token.
 func (w *Worker) finalisationFailed(ctx context.Context, log *slog.Logger, claim domain.UpdateTask, op string, err error) {
 	if errors.Is(err, domain.ErrStaleClaim) {
 		log.Warn("claim lost, result discarded", slog.String("op", op), slog.Any("error", err))
@@ -274,13 +216,8 @@ func (w *Worker) finalisationFailed(ctx context.Context, log *slog.Logger, claim
 	}
 }
 
-// release hands a claim back to the queue during shutdown.
-//
-// The write outlives the cancellation that caused it: derived from the task's
-// context so that the connection settings and values on it are kept, but
-// without its cancellation, which has already fired. A failure here is not
-// worth holding the shutdown for -- the task simply stays in progress, which
-// is the state the recovery pass exists for.
+// A failure here is not worth holding the shutdown for: the task stays in
+// progress, which is the state the recovery pass exists for.
 func (w *Worker) release(ctx context.Context, log *slog.Logger, claim domain.UpdateTask) {
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 	defer cancel()
@@ -294,7 +231,6 @@ func (w *Worker) release(ctx context.Context, log *slog.Logger, claim domain.Upd
 	log.Info("task released back to the queue")
 }
 
-// failureReason maps a provider error to the sentence a client is shown.
 func (w *Worker) failureReason(err error) string {
 	if errors.Is(err, provider.ErrTransient) {
 		return fmt.Sprintf(reasonUnavailable, w.settings.ProviderAttempts)

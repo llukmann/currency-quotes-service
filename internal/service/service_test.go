@@ -83,9 +83,9 @@ func (s *stubRepo) GetLatestQuote(ctx context.Context, pair domain.Pair) (domain
 	return s.quote, nil
 }
 
-// TestServiceCreateTask covers the one decision this method owns: a worker is
-// woken only for a task that is actually waiting to be claimed. The pair
-// arrives already parsed, so there is nothing left here to refuse.
+// The one decision this method owns: a worker is woken only for a task that is
+// actually waiting to be claimed. The pair arrives already parsed, so there is
+// nothing left here to refuse.
 func TestServiceCreateTask(t *testing.T) {
 	key := uuid.New()
 	conflict := domain.ErrKeyConflict
@@ -196,9 +196,9 @@ func TestServiceCreateTask(t *testing.T) {
 	}
 }
 
-// TestServiceCreateTaskSignalsAfterTheRowExists checks the ordering the signal
-// depends on. A worker woken by it claims from the table, so a signal sent
-// ahead of the insert would find an empty queue and be spent for nothing.
+// The ordering the signal depends on. A worker woken by it claims from the
+// table, so a signal sent ahead of the insert would find an empty queue and be
+// spent for nothing.
 func TestServiceCreateTaskSignalsAfterTheRowExists(t *testing.T) {
 	wake := make(chan struct{}, 1)
 
@@ -216,10 +216,9 @@ func TestServiceCreateTaskSignalsAfterTheRowExists(t *testing.T) {
 	require.Len(t, wake, 1)
 }
 
-// TestServiceCreateTaskDoesNotWaitOnTheSignal checks that a response never
-// waits on a worker. The task is committed by the time the signal is sent, and
-// a worker that misses it still polls -- so a full or unread channel has to
-// cost nothing rather than hold the request open.
+// A response never waits on a worker. The task is committed by the time the
+// signal is sent, and a worker that misses it still polls -- so a full or
+// unread channel has to cost nothing rather than hold the request open.
 func TestServiceCreateTaskDoesNotWaitOnTheSignal(t *testing.T) {
 	repo := &stubRepo{
 		task: domain.UpdateTask{ID: uuid.New(), Pair: domain.Pair("EUR/MXN"), Status: domain.StatusPending},
@@ -246,10 +245,9 @@ func TestServiceCreateTaskDoesNotWaitOnTheSignal(t *testing.T) {
 	}
 }
 
-// TestServiceCreateTaskQueuesOneSignalForABurst checks that the signal says the
-// queue is worth looking at rather than how much is in it: a worker that wakes
-// goes on claiming until the queue is empty, so a burst of posts costs one
-// wakeup.
+// The signal says the queue is worth looking at rather than how much is in it:
+// a worker that wakes goes on claiming until the queue is empty, so a burst of
+// posts costs one wakeup.
 func TestServiceCreateTaskQueuesOneSignalForABurst(t *testing.T) {
 	repo := &stubRepo{
 		task: domain.UpdateTask{ID: uuid.New(), Pair: domain.Pair("EUR/MXN"), Status: domain.StatusPending},
@@ -267,9 +265,8 @@ func TestServiceCreateTaskQueuesOneSignalForABurst(t *testing.T) {
 	require.Len(t, wake, 1)
 }
 
-// TestServiceGetTask checks the lookup a client polls with. Every status is an
-// answer, failed included, so the only error it can produce is one storage
-// raised.
+// The lookup a client polls with. Every status is an answer, failed included,
+// so the only error it can produce is one storage raised.
 func TestServiceGetTask(t *testing.T) {
 	id := uuid.New()
 
@@ -293,9 +290,8 @@ func TestServiceGetTask(t *testing.T) {
 	require.Equal(t, []uuid.UUID{id}, repo.fetched)
 }
 
-// TestServiceGetTaskNotFound checks that a missing task is reported as such
-// rather than as a failure: the API turns this one into a 404 and everything
-// else into a 500.
+// A missing task is reported as such rather than as a failure: the API turns
+// this one into a 404 and everything else into a 500.
 func TestServiceGetTaskNotFound(t *testing.T) {
 	repo := &stubRepo{getErr: domain.ErrNotFound}
 
@@ -304,8 +300,8 @@ func TestServiceGetTaskNotFound(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrNotFound)
 }
 
-// TestServiceGetLatestQuote covers the read: the pair reaches storage as it was
-// handed in, and what storage answers is what the caller gets.
+// The read: the pair reaches storage as it was handed in, and what storage
+// answers is what the caller gets.
 func TestServiceGetLatestQuote(t *testing.T) {
 	quote := domain.Quote{
 		UpdateID:  uuid.New(),
@@ -353,8 +349,7 @@ func TestServiceGetLatestQuote(t *testing.T) {
 	}
 }
 
-// boolToInt renders an expectation about the wakeup channel as the length it
-// should have: one signal or none.
+// One signal or none.
 func boolToInt(b bool) int {
 	if b {
 		return 1
@@ -367,21 +362,13 @@ func boolToInt(b bool) int {
 // made up somewhere below can be told from the one that was passed down.
 type callerKey struct{}
 
-// TestServicePassesTheCallersContext covers the rule the whole request path
-// rests on: the context reaches the driver, so a client that goes away or a
-// deadline that expires stops the work rather than leaving it running against
-// a connection nobody is waiting on.
+// The context has to reach the driver, or a client that goes away leaves work
+// running against a connection nobody is waiting on.
 //
-// Two things are asked of it, because one is not enough. The value says the
-// context was inherited rather than made -- a context.Background() carries
-// none. The cancellation says what was inherited is still the caller's: a
-// context.WithoutCancel would carry the value across and drop the only part
-// that matters.
-//
-// The linter catches the first of those spellings today, which is worth
-// having and is not the same as a test: it holds for as long as the
-// configuration does, and it recognises the mistake by its shape rather than
-// by its effect.
+// Two things are asked of it: the value says the context was inherited rather
+// than made, and the cancellation says what was inherited is still the
+// caller's -- a context.WithoutCancel would carry the value across and drop
+// the only part that matters.
 func TestServicePassesTheCallersContext(t *testing.T) {
 	tests := []struct {
 		name string
@@ -435,10 +422,9 @@ func TestServicePassesTheCallersContext(t *testing.T) {
 	}
 }
 
-// TestServiceGettersPassStorageFailuresUp checks that a database that has
-// stopped answering is reported as itself. The API turns the domain errors into
-// 400 and 404 and everything else into a 500, so an error invented here would
-// be a 500 with a cause nobody wrote down.
+// A database that has stopped answering is reported as itself. The API turns
+// the domain errors into 400 and 404 and everything else into a 500, so an
+// error invented here would be a 500 with a cause nobody wrote down.
 func TestServiceGettersPassStorageFailuresUp(t *testing.T) {
 	unreachable := errors.New("connection refused")
 

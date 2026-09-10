@@ -39,34 +39,28 @@ func run() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
 
-	// Cancelled on SIGINT/SIGTERM. The errgroup derives its own context from
-	// this one, which is also cancelled by the first error of any goroutine in
-	// the group: the server, the workers and the recovery pass.
+	// The errgroup derives its own context from this one, so the first error of
+	// any goroutine in the group cancels the rest.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Closed by the deferred call rather than by whoever uses it, and that
-	// happens after the group below has been waited on -- a pool closed while
-	// a worker still holds a connection would fail the very finalisation the
-	// shutdown is waiting for.
+	// Closed by the deferred call, which runs after the group below has been
+	// waited on: a pool closed while a worker still holds a connection would fail
+	// the very finalisation the shutdown is waiting for.
 	repo, err := postgres.New(ctx, cfg.DatabaseURL, cfg.IdempotencyTTL)
 	if err != nil {
 		return err
 	}
 	defer repo.Close()
 
-	// The retrier is what the worker holds: how many times an upstream is asked
-	// is a property of the call, not a decision the worker makes each time.
 	rates := provider.NewRetrier(
 		provider.NewClient(cfg.ProviderBaseURL, cfg.ProviderTimeout),
 		cfg.ProviderAttempts,
 		cfg.ProviderBackoff,
 	)
 
-	// The signal that a task has just been posted: written by the handler path,
-	// read by whichever worker is idle. Buffered by one and written without
-	// blocking, so it says "the queue is worth a look" rather than counting
-	// anything -- see Service.notify.
+	// Buffered by one and written without blocking: it says "the queue is worth a
+	// look" rather than counting anything.
 	wake := make(chan struct{}, 1)
 
 	svc := service.New(repo, wake)
@@ -88,10 +82,9 @@ func run() error {
 		Handler:      api.NewRouter(svc, logger, cfg.HandlerTimeout()),
 		ReadTimeout:  cfg.HTTPReadTimeout,
 		WriteTimeout: cfg.HTTPWriteTimeout,
-		// Everything net/http reports on its own -- a malformed request line, a
-		// panic our middleware never saw -- goes through the same handler as
-		// the rest of the service. Left unset it writes plain text to stderr,
-		// which is the one thing that breaks a stream of JSON logs.
+		// Left unset, net/http writes plain text to stderr for a malformed request
+		// line or a panic our middleware never saw, which is the one thing that
+		// breaks a stream of JSON logs.
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 
@@ -108,9 +101,8 @@ func run() error {
 	})
 
 	// One instance behind all of them: a worker holds nothing that changes, and
-	// the arbitration is the queue's own -- claiming is a single statement with
-	// SKIP LOCKED, so two goroutines asking at once get two different tasks
-	// rather than one of them waiting.
+	// the arbitration is the queue.s own -- claiming with SKIP LOCKED gives two
+	// goroutines asking at once two different tasks.
 	logger.Info("worker pool started", slog.Int("size", cfg.WorkerConcurrency))
 
 	for range cfg.WorkerConcurrency {

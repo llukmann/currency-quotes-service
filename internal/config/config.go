@@ -40,22 +40,18 @@ const (
 	maxPort = 65535
 )
 
-// handlerTimeoutMargin is how much of HTTP_WRITE_TIMEOUT is kept back from the
-// deadline of a request, so that a handler which runs out of time still has
-// room to write its answer. Without the gap the two deadlines would expire
-// together and the server would drop the connection in the middle of the very
-// error the deadline was meant to produce, leaving a client that saw a broken
-// connection where the contract promises an envelope.
+// Kept back from the request deadline so that a handler which runs out of time
+// still has room to write its answer. Without the gap the two deadlines expire
+// together and the server drops the connection in the middle of the very error
+// the deadline was meant to produce.
 const handlerTimeoutMargin = time.Second
 
-// stuckTimeoutMargin is how many task deadlines a task may spend in_progress
-// before the recovery pass treats it as abandoned. Plain "longer than one
-// deadline" would not do: the deadline is measured by this process, the
-// staleness threshold by the database clock, and between the claim commit and
-// the start of the deadline lie things the deadline never counted -- waiting
-// for a pooled connection, the finalising transaction itself, CPU throttling.
-// Erring high costs a delay before a dead worker's task is picked up; erring
-// low takes tasks away from workers that are still alive.
+// How many task deadlines a task may spend in_progress before the recovery pass
+// treats it as abandoned. Plain "longer than one deadline" would not do: the
+// deadline is measured by this process, the staleness threshold by the database
+// clock, and between the claim commit and the start of the deadline lie things
+// the deadline never counted. Erring low takes tasks away from workers that are
+// still alive.
 const stuckTimeoutMargin = 2
 
 // Config holds the service parameters. Variable names are listed in
@@ -68,44 +64,33 @@ type Config struct {
 	ShutdownTimeout  time.Duration
 	LogLevel         slog.Level
 
-	// ProviderBaseURL is the scheme and host of the rate API, without a path:
-	// the path belongs to the client that knows the API.
+	// Scheme and host without a path: the path belongs to the client that knows
+	// the API.
 	ProviderBaseURL string
-	// ProviderTimeout bounds one HTTP attempt, not the whole retry schedule.
+	// Bounds one HTTP attempt, not the whole retry schedule.
 	ProviderTimeout  time.Duration
 	ProviderAttempts int
-	// ProviderBackoff is the pause before the second attempt, doubling before
-	// each attempt after it.
+	// The pause before the second attempt, doubling before each after it.
 	ProviderBackoff time.Duration
 
-	// WorkerConcurrency is how many tasks are processed at the same time.
-	WorkerConcurrency int
-	// WorkerPollInterval is how long a worker waits before asking an empty
-	// queue again.
+	WorkerConcurrency  int
 	WorkerPollInterval time.Duration
-	// WorkerTaskTimeout is the deadline of a single task. It covers the whole
-	// path from the claim to the finalising commit: the provider call with all
-	// of its retries, and the database work that follows it.
+	// Covers the whole path from the claim to the finalising commit.
 	WorkerTaskTimeout time.Duration
-	// WorkerStuckTimeout is how long a task may sit in_progress before the
-	// recovery pass takes it back, see stuckTimeoutMargin.
-	WorkerStuckTimeout time.Duration
-	// WorkerRecoveryInterval is how often that pass runs.
+	// See stuckTimeoutMargin for why it cannot simply be the task deadline.
+	WorkerStuckTimeout     time.Duration
 	WorkerRecoveryInterval time.Duration
-	// WorkerMaxAttempts is how many times a task may be claimed before the
-	// recovery pass closes it as failed instead of releasing it once more.
-	WorkerMaxAttempts int
+	WorkerMaxAttempts      int
 
-	// IdempotencyTTL is how long the binding between an Idempotency-Key and
-	// the task it was answered with holds. It is also the longest a post can
-	// silently perform no update at all, which is why it is far shorter than
-	// the day such keys are conventionally kept: a client repeating a live key
-	// is handed the earlier task rather than a fresh rate.
+	// Also the longest a post can silently perform no update at all, which is
+	// why it is far shorter than the day such keys are conventionally kept: a
+	// client repeating a live key is handed the earlier task rather than a fresh
+	// rate.
 	IdempotencyTTL time.Duration
 }
 
-// Load reads the configuration from the environment. Unset variables fall
-// back to defaults; a malformed value is an error naming the variable.
+// Unset variables fall back to defaults; a malformed value is an error naming
+// the variable.
 func Load() (Config, error) {
 	var cfg Config
 	var err error
@@ -196,20 +181,15 @@ func (c Config) check() error {
 	return nil
 }
 
-// HandlerTimeout is the deadline of a single request, bounding everything a
-// handler does: it is what stops a query against an unreachable database from
-// holding a goroutine and a pooled connection for as long as the outage lasts.
-//
-// Derived rather than configured. It has to stay strictly under
-// HTTP_WRITE_TIMEOUT, which is the point at which the server stops writing at
-// all, and a variable of its own would let the two be set the wrong way round.
-// CheckTimeouts is what guarantees the result is positive.
+// Derived rather than configured: it has to stay strictly under
+// HTTP_WRITE_TIMEOUT, and a variable of its own would let the two be set the
+// wrong way round. check is what guarantees the result is positive.
 func (c Config) HandlerTimeout() time.Duration {
 	return c.HTTPWriteTimeout - handlerTimeoutMargin
 }
 
-// requiredFromEnv reads a variable that has no meaningful default. Connecting
-// to some arbitrary fallback database is worse than refusing to start.
+// Connecting to some arbitrary fallback database is worse than refusing to
+// start.
 func requiredFromEnv(key string) (string, error) {
 	raw, ok := os.LookupEnv(key)
 	if !ok || raw == "" {
@@ -242,9 +222,8 @@ func intFromEnv(key string, def int) (int, error) {
 	return v, nil
 }
 
-// positiveIntFromEnv reads a count. Zero is rejected rather than taken
-// literally: a pool of no workers, or a provider allowed no attempts, is a
-// service that quietly does nothing.
+// Zero is rejected rather than taken literally: a pool of no workers, or a
+// provider allowed no attempts, is a service that quietly does nothing.
 func positiveIntFromEnv(key string, def int) (int, error) {
 	v, err := intFromEnv(key, def)
 	if err != nil {

@@ -17,7 +17,6 @@ const internalErrorMessage = "internal error"
 
 const contentTypeJSON = "application/json"
 
-// writeErrorJSON answers with the single error envelope of this API.
 func writeErrorJSON(w http.ResponseWriter, status int, code contract.ErrorCode, message string) {
 	var body contract.Error
 	body.Error.Code = code
@@ -28,19 +27,17 @@ func writeErrorJSON(w http.ResponseWriter, status int, code contract.ErrorCode, 
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// writePairError answers a pair the domain refused. The message is the sentence
-// ParsePair wrote, which names what is wrong with this particular pair.
+// The message is the sentence ParsePair wrote, which names what is wrong with
+// this particular pair rather than restating the code.
 func writePairError(w http.ResponseWriter, err error) {
 	writeErrorJSON(w, http.StatusBadRequest, contract.ErrorCodeInvalidPair, err.Error())
 }
 
-// writeParamError answers a request the generated binder turned away before any
-// handler saw it, and is what keeps those answers inside the envelope.
-//
-// A pair that was not sent is answered as a pair that cannot be parsed, which
-// is what the spec promises: missing, malformed and unsupported are one answer
-// there. The message comes from ParsePair itself so that the two paths cannot
-// drift apart.
+// Keeps the answers of the generated binder, which turns a request away before
+// any handler sees it, inside the envelope. A pair that was not sent is
+// answered as a pair that cannot be parsed -- the spec makes missing, malformed
+// and unsupported one answer -- and the message comes from ParsePair so the two
+// paths cannot drift apart.
 func (h *handler) writeParamError(w http.ResponseWriter, r *http.Request, err error) {
 	var missing *contract.RequiredParamError
 	if errors.As(err, &missing) && missing.ParamName == "pair" {
@@ -76,7 +73,6 @@ func (h *handler) writeParamError(w http.ResponseWriter, r *http.Request, err er
 	h.writeInternal(w, r, err)
 }
 
-// writeJSON writes a successful body.
 func (h *handler) writeJSON(w http.ResponseWriter, r *http.Request, status int, body any) {
 	w.Header().Set("Content-Type", contentTypeJSON)
 	w.WriteHeader(status)
@@ -97,14 +93,12 @@ func (h *handler) writeJSON(w http.ResponseWriter, r *http.Request, status int, 
 	}
 }
 
-// clientGone reports a request whose context was cancelled by the client
-// hanging up, as opposed to one the deadline ended.
 func clientGone(ctx context.Context) bool {
 	return errors.Is(ctx.Err(), context.Canceled)
 }
 
-// logAbandoned records a request nobody is waiting for. Info rather than error:
-// a client that hangs up is not a failure of this service.
+// Info rather than error: a client that hangs up is not a failure of this
+// service.
 func (h *handler) logAbandoned(r *http.Request, err error) {
 	h.logger.Info("request abandoned by the client",
 		slog.Any("error", err),
@@ -114,9 +108,6 @@ func (h *handler) logAbandoned(r *http.Request, err error) {
 	)
 }
 
-// writeInternal is where what a client is told and what the log is told part
-// company: the cause goes to the log with the request id, the client gets the
-// code alone.
 func (h *handler) writeInternal(w http.ResponseWriter, r *http.Request, err error) {
 	if clientGone(r.Context()) {
 		h.logAbandoned(r, err)

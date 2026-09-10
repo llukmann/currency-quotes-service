@@ -62,11 +62,10 @@ func testRecoverySettings() RecoverySettings {
 	return RecoverySettings{Interval: time.Hour, StuckTimeout: 90 * time.Second, MaxAttempts: 3}
 }
 
-// TestRecoveryPassUsesItsSettings checks that the numbers reach the statement.
-// Two of them are durations of very different meaning -- how often the pass
-// runs and how long a task may sit before it counts as abandoned -- and passing
-// the first where the second belongs compiles, leaving the threshold silently
-// set to the tick.
+// The numbers reach the statement. Two of them are durations of very different
+// meaning -- how often the pass runs and how long a task may sit before it
+// counts as abandoned -- and passing the first where the second belongs
+// compiles, leaving the threshold silently set to the tick.
 //
 // The third is the attempt limit, which is used twice: once as the limit and
 // once inside the sentence a client is shown. They have to be the same number,
@@ -85,11 +84,10 @@ func TestRecoveryPassUsesItsSettings(t *testing.T) {
 	require.Equal(t, "abandoned after 3 attempts", got.reason)
 }
 
-// TestRecoveryPassReportsWhatItDid covers the two counts and why they are kept
-// apart. A steady trickle of releases says workers are dying, or that the
-// threshold is tight enough to be taking tasks from workers still at work; an
-// abandonment says one task keeps killing whoever picks it up. A single total
-// would hide both.
+// The two counts and why they are kept apart. A steady trickle of releases
+// says workers are dying, or that the threshold is tight enough to be taking
+// tasks from workers still at work; an abandonment says one task keeps killing
+// whoever picks it up. A single total would hide both.
 //
 // A pass that found nothing says nothing, which is what most passes do.
 func TestRecoveryPassReportsWhatItDid(t *testing.T) {
@@ -155,11 +153,11 @@ func TestRecoveryPassReportsWhatItDid(t *testing.T) {
 	}
 }
 
-// TestRecoveryPassFailure covers the difference between a pass that failed and
-// a pass that was interrupted. The second happens on every shutdown, and
-// reported as a failure it would put an error in the log of every clean stop --
-// the tasks it would have released are stale by age, and the next process to
-// start finds them exactly as they are.
+// The difference between a pass that failed and a pass that was interrupted.
+// The second happens on every shutdown, and reported as a failure it would put
+// an error in the log of every clean stop -- the tasks it would have released
+// are stale by age, and the next process to start finds them exactly as they
+// are.
 func TestRecoveryPassFailure(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -205,9 +203,9 @@ func TestRecoveryPassFailure(t *testing.T) {
 	}
 }
 
-// TestRecoveryRunWaitsOutTheFirstInterval checks that the pass does not run at
-// startup. Nothing left behind by the previous process is stale before
-// StuckTimeout has passed anyway, and by then the tick will have come round.
+// The pass does not run at startup. Nothing left behind by the previous
+// process is stale before StuckTimeout has passed anyway, and by then the tick
+// will have come round.
 func TestRecoveryRunWaitsOutTheFirstInterval(t *testing.T) {
 	repo := &stubRecoveryRepo{}
 
@@ -224,9 +222,9 @@ func TestRecoveryRunWaitsOutTheFirstInterval(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-// TestRecoveryRunPassesOnEveryTick covers the loop itself, and that a shutdown
-// is a stop rather than a failure: the group main waits on takes this return
-// value, and an error here would bring down everything else on the way out.
+// The loop itself, and that a shutdown is a stop rather than a failure: the
+// group main waits on takes this return value, and an error here would bring
+// down everything else on the way out.
 func TestRecoveryRunPassesOnEveryTick(t *testing.T) {
 	repo := &stubRecoveryRepo{}
 	settings := RecoverySettings{Interval: time.Millisecond, StuckTimeout: 90 * time.Second, MaxAttempts: 3}

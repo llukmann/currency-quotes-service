@@ -128,9 +128,9 @@ func TestRetrierFetchRate(t *testing.T) {
 	}
 }
 
-// TestRetrierBackoffIsInterruptible checks that the pause between attempts ends
-// with the context rather than with the timer. The backoff is an hour: if the
-// wait were not interruptible this test would not fail, it would hang.
+// The pause between attempts ends with the context rather than with the timer.
+// The backoff is an hour: if the wait were not interruptible this test would
+// not fail, it would hang.
 func TestRetrierBackoffIsInterruptible(t *testing.T) {
 	stub := &stubProvider{results: []stubResult{{err: fmt.Errorf("upstream status 503: %w", ErrTransient)}}}
 
