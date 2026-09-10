@@ -41,12 +41,12 @@ jobs:
       - name: tests without a database
         run: go test ./...
 
-      # The commands .env.example gives a human, run as written, so that
+      # The commands README gives a human, run as written, so that
       # instructions which stop working stop the build with them.
       - name: schema
         run: |
           docker compose run --rm migrate
-          docker compose exec -T postgres psql -U quotes -d quotes -c 'CREATE DATABASE quotes_test'
+          docker compose exec -T postgres createdb -U quotes quotes_test
           docker compose run --rm migrate -path=/migrations \
             -database "postgres://quotes:quotes@postgres:5432/quotes_test?sslmode=disable" up
 

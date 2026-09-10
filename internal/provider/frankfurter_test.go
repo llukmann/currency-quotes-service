@@ -16,9 +16,9 @@ import (
 	"github.com/llukmann/currency-quotes-service/internal/domain"
 )
 
-// mustParsePair builds the pair the tests ask for. Going through the
-// constructor rather than converting a literal keeps the tests honest about
-// where a Pair comes from: Currencies below only works because of it.
+// Going through the constructor rather than converting a literal keeps the
+// tests honest about where a Pair comes from: Currencies below only works
+// because of it.
 func mustParsePair(t *testing.T, s string) domain.Pair {
 	t.Helper()
 
@@ -28,9 +28,9 @@ func mustParsePair(t *testing.T, s string) domain.Pair {
 	return p
 }
 
-// TestClientFetchRate drives the client against a stand-in upstream. The cases
-// that matter are the ones a live request cannot produce: a null rate, a body
-// that does not parse, a 429, a 500.
+// The client against a stand-in upstream. The cases that matter are the ones a
+// live request cannot produce: a null rate, a body that does not parse, a 429,
+// a 500.
 func TestClientFetchRate(t *testing.T) {
 	// The day every successful case below reports.
 	wantDate := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
@@ -190,11 +190,10 @@ func TestClientFetchRate(t *testing.T) {
 	}
 }
 
-// TestClientFetchRateBodyCutShort covers the upstream that promises a body and
-// then goes away half way through it. The answer never becomes a status the
-// client can classify, so the failure has to be marked transient here, in the
-// read -- an upstream that died mid-sentence is exactly the kind another
-// attempt may not meet.
+// The upstream that promises a body and then goes away half way through it.
+// The answer never becomes a status the client can classify, so the failure
+// has to be marked transient here, in the read -- an upstream that died
+// mid-sentence is exactly the kind another attempt may not meet.
 //
 // Not the same case as the truncated body in the table above: that one is a
 // complete HTTP response carrying JSON that does not parse, and it fails a
@@ -225,12 +224,11 @@ func TestClientFetchRateBodyCutShort(t *testing.T) {
 	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 }
 
-// TestClientFetchRateContextCancelledMidBody is the other half of the rule
-// TestClientFetchRateContextCancelled covers. A cancellation can land after the
-// headers have arrived as easily as before them, and the read has to tell the
-// two apart the same way the request does: the caller leaving is not the
-// upstream failing, and marked transient it would buy a backoff nobody is
-// waiting out.
+// The other half of the rule TestClientFetchRateContextCancelled covers. A
+// cancellation can land after the headers have arrived as easily as before
+// them, and the read has to tell the two apart the same way the request does:
+// the caller leaving is not the upstream failing, and marked transient it
+// would buy a backoff nobody is waiting out.
 func TestClientFetchRateContextCancelledMidBody(t *testing.T) {
 	reached := make(chan struct{})
 
@@ -271,20 +269,12 @@ func TestClientFetchRateContextCancelledMidBody(t *testing.T) {
 	require.NotErrorIs(t, err, ErrTransient)
 }
 
-// TestClientFetchRateReadsNoMoreThanTheCap checks the bound on what an upstream
-// can make this process hold. A rate answer is a few hundred bytes; anything
-// past the cap is not one, and reading it whole would let a misbehaving
-// upstream exhaust the worker that asked.
-//
 // The body below is a valid answer with the rate placed beyond the cap, so the
-// truncation is what the assertion rests on: read whole it would parse, and
-// read to the cap it cannot. The failure is permanent -- asking again returns
-// the same oversized body.
+// truncation is what the assertion rests on: read whole it would parse, read
+// to the cap it cannot.
 //
-// The padding is sized from the constant rather than written out, so this
-// checks that a cap is enforced and not what it is set to. The number itself is
-// a tuning decision with nothing downstream depending on it; that the read
-// stops somewhere is the invariant.
+// The padding is sized from the constant, so this checks that a cap is
+// enforced and not what it is set to.
 func TestClientFetchRateReadsNoMoreThanTheCap(t *testing.T) {
 	padding := strings.Repeat("x", maxBodySize)
 	body := `{"padding":"` + padding + `","date":"2026-09-07","rates":{"MXN":19.6552}}`
@@ -301,10 +291,9 @@ func TestClientFetchRateReadsNoMoreThanTheCap(t *testing.T) {
 	require.Greater(t, len(body), maxBodySize, "the body has to be larger than the cap for this to prove anything")
 }
 
-// TestClientFetchRateQuotesOnlyASnippetOfTheBody checks the other half of that
-// bound. The error below is written on every failed attempt of every task, and
-// the body it describes is capped at 64 KB -- which is 64 KB per line in the
-// log unless it is cut here.
+// The other half of that bound. The error below is written on every failed
+// attempt of every task, and the body it describes is capped at 64 KB -- which
+// is 64 KB per line in the log unless it is cut here.
 func TestClientFetchRateQuotesOnlyASnippetOfTheBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -320,9 +309,9 @@ func TestClientFetchRateQuotesOnlyASnippetOfTheBody(t *testing.T) {
 	require.Less(t, len(err.Error()), snippetSize*2)
 }
 
-// TestSnippet pins where the cut falls. The boundary is the whole of what this
-// function decides, and an off-by-one either way is invisible in the messages
-// it appears in.
+// Where the cut falls. The boundary is the whole of what this function
+// decides, and an off-by-one either way is invisible in the messages it
+// appears in.
 func TestSnippet(t *testing.T) {
 	tests := []struct {
 		name string
@@ -360,11 +349,10 @@ func TestSnippet(t *testing.T) {
 	}
 }
 
-// TestClientFetchRateMalformedBaseURL covers the one failure that happens
-// before anything is sent. The host is configuration, so this is the shape a
-// typo in PROVIDER_BASE_URL takes, and it is deliberately not transient:
-// retrying a URL that cannot be parsed spends the budget on the same answer
-// three times.
+// The one failure that happens before anything is sent. The host is
+// configuration, so this is the shape a typo in PROVIDER_BASE_URL takes, and
+// it is deliberately not transient: retrying a URL that cannot be parsed
+// spends the budget on the same answer three times.
 func TestClientFetchRateMalformedBaseURL(t *testing.T) {
 	_, err := NewClient("http://exa mple.com", time.Minute).
 		FetchRate(t.Context(), mustParsePair(t, "EUR/MXN"))
@@ -373,10 +361,10 @@ func TestClientFetchRateMalformedBaseURL(t *testing.T) {
 	require.NotErrorIs(t, err, ErrTransient)
 }
 
-// TestNewClientTrimsATrailingSlash checks the one thing the constructor does to
-// its argument. A host written with a slash is the likelier spelling of the
-// two, and left alone it would produce a double slash in the path -- which the
-// upstream is under no obligation to treat as the same endpoint.
+// The one thing the constructor does to its argument. A host written with a
+// slash is the likelier spelling of the two, and left alone it would produce a
+// double slash in the path -- which the upstream is under no obligation to
+// treat as the same endpoint.
 func TestNewClientTrimsATrailingSlash(t *testing.T) {
 	var gotPath string
 
@@ -394,8 +382,7 @@ func TestNewClientTrimsATrailingSlash(t *testing.T) {
 	require.Equal(t, latestPath, gotPath)
 }
 
-// TestClientFetchRateUnreachableUpstream covers the failure that never reaches
-// a status code at all.
+// The failure that never reaches a status code at all.
 func TestClientFetchRateUnreachableUpstream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	addr := srv.URL
@@ -406,9 +393,9 @@ func TestClientFetchRateUnreachableUpstream(t *testing.T) {
 	require.ErrorIs(t, err, ErrTransient)
 }
 
-// TestClientFetchRateTimesOut checks the per-attempt timeout, which is what
-// stops an upstream that accepts a connection and then says nothing from
-// holding a worker for the whole budget of its task.
+// The per-attempt timeout, which is what stops an upstream that accepts a
+// connection and then says nothing from holding a worker for the whole budget
+// of its task.
 func TestClientFetchRateTimesOut(t *testing.T) {
 	release := make(chan struct{})
 
@@ -422,10 +409,9 @@ func TestClientFetchRateTimesOut(t *testing.T) {
 	require.ErrorIs(t, err, ErrTransient)
 }
 
-// TestClientFetchRateContextCancelled checks that a cancelled context comes
-// back as itself and unmarked. Reported as transient it would be retried, and
-// the retrier would sleep out a backoff on behalf of a caller that has already
-// gone.
+// A cancelled context comes back as itself and unmarked. Reported as transient
+// it would be retried, and the retrier would sleep out a backoff on behalf of
+// a caller that has already gone.
 func TestClientFetchRateContextCancelled(t *testing.T) {
 	reached := make(chan struct{})
 

@@ -7,11 +7,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestParsePair pins the whitelist and the normalisation, which is the whole
-// of what makes a Pair trustworthy further down: every value of the type comes
-// through here, and nothing below revalidates one. The cases that matter are
-// the refusals -- the constraint in the schema knows only the shape of a pair
-// and would accept every unsupported currency below.
+// Every value of the type comes through here and nothing below revalidates
+// one, so the refusals are the cases that matter: the schema constraint knows
+// only the shape of a pair and would accept every unsupported currency below.
 func TestParsePair(t *testing.T) {
 	tests := []struct {
 		name string
@@ -114,13 +112,10 @@ func TestParsePair(t *testing.T) {
 	}
 }
 
-// TestSupportedCurrencies is the only guard the whitelist has. Nothing else
-// would notice a fourth currency: the CHECK constraint on the column knows the
-// shape of a pair and not the set, the provider quotes whatever it is asked
-// for, and every test around this one goes on passing with a longer list.
-//
-// So the set is pinned here rather than described anywhere. Widening it is a
-// decision, and this is what makes it one instead of an edit.
+// The only guard the whitelist has: the CHECK constraint knows the shape of a
+// pair and not the set, the provider quotes whatever it is asked for, and
+// every other test goes on passing with a longer list. Pinning it here makes
+// widening the set a decision rather than an edit.
 func TestSupportedCurrencies(t *testing.T) {
 	got := make([]string, 0, len(supportedCurrencies))
 	for currency := range supportedCurrencies {
@@ -132,10 +127,10 @@ func TestSupportedCurrencies(t *testing.T) {
 	require.Equal(t, []string{"EUR", "MXN", "USD"}, got)
 }
 
-// TestParsePairAcceptsEveryCombination spells out what the whitelist adds up
-// to. It is kept per currency, so the pairs are a consequence rather than a
-// list anybody wrote down -- three currencies, each priced in either of the
-// other two, and these six are the whole of what the service quotes.
+// What the whitelist adds up to. It is kept per currency, so the pairs are a
+// consequence rather than a list anybody wrote down -- three currencies, each
+// priced in either of the other two, and these six are the whole of what the
+// service quotes.
 func TestParsePairAcceptsEveryCombination(t *testing.T) {
 	pairs := []string{"USD/EUR", "USD/MXN", "EUR/USD", "EUR/MXN", "MXN/USD", "MXN/EUR"}
 
@@ -149,9 +144,9 @@ func TestParsePairAcceptsEveryCombination(t *testing.T) {
 	}
 }
 
-// TestPairCurrencies checks the split the provider builds its request from.
-// The halves have to come back in the order they were written in, since one is
-// the currency being priced and the other the currency it is priced in.
+// The split the provider builds its request from. The halves have to come back
+// in the order they were written in, since one is the currency being priced
+// and the other the currency it is priced in.
 func TestPairCurrencies(t *testing.T) {
 	pair, err := ParsePair("eur/mxn")
 	require.NoError(t, err)
@@ -162,15 +157,10 @@ func TestPairCurrencies(t *testing.T) {
 	require.Equal(t, "MXN", quote)
 }
 
-// TestPairCurrenciesOfAValueThatNeverParsed pins what the method does with a
-// Pair that did not come from ParsePair. The type is exported, so such a value
-// compiles, and the invariant behind Currencies is a convention rather than a
-// rule -- held by there being one constructor, not by the compiler.
-//
-// It is here to record the shape of the failure, not to bless it. What matters
-// is that a broken value leaves a currency missing rather than silently naming
-// the wrong one: the request then goes out incomplete and the upstream refuses
-// it, instead of a rate for some other pair being stored.
+// The type is exported, so a Pair that never came from ParsePair compiles.
+// This records the shape of that failure rather than blessing it: a broken
+// value leaves a currency missing rather than silently naming the wrong one,
+// so the request goes out incomplete and the upstream refuses it.
 func TestPairCurrenciesOfAValueThatNeverParsed(t *testing.T) {
 	tests := []struct {
 		name      string

@@ -12,10 +12,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestConfigCheckTimeouts pins the two invariants the service refuses to start
-// without. Load runs them, so a case here states what has to be rejected
-// without having to reach for the environment. The numbers are the configured
-// defaults, so a change to them shows up as a failure with a name on it.
+// The two invariants the service refuses to start without. Load runs them, so
+// a case here states what has to be rejected without having to reach for the
+// environment. The numbers are the configured defaults, so a change to them
+// shows up as a failure with a name on it.
 func TestConfigCheckTimeouts(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -83,10 +83,9 @@ func TestConfigCheckTimeouts(t *testing.T) {
 	}
 }
 
-// TestConfigHandlerTimeout states the relation the request deadline is derived
-// by, since nothing downstream of it can tell a deadline that is too generous
-// from one that is right: the difference only shows as a connection dropped
-// mid-answer under load.
+// The relation the request deadline is derived by, since nothing downstream of
+// it can tell a deadline that is too generous from one that is right: the
+// difference only shows as a connection dropped mid-answer under load.
 func TestConfigHandlerTimeout(t *testing.T) {
 	cfg := Config{HTTPWriteTimeout: 10 * time.Second}
 
@@ -94,14 +93,9 @@ func TestConfigHandlerTimeout(t *testing.T) {
 	require.Less(t, cfg.HandlerTimeout(), cfg.HTTPWriteTimeout)
 }
 
-// serviceVariables is every environment variable Load reads, taken from the
-// source rather than from a list kept here.
-//
-// The names already exist in three places -- this package, .env.example and
-// docker-compose.yml -- and the tests below are about those three agreeing. A
-// fourth copy written out here would be one more thing to keep in step, and it
-// would be the copy that decides whether the others are checked at all: a
-// variable forgotten in it is a variable no test asks about.
+// A fourth copy of the names would be the copy that decides whether the other
+// three are checked at all: a variable forgotten in it is a variable no test
+// asks about.
 func serviceVariables(t *testing.T) []string {
 	t.Helper()
 
@@ -123,13 +117,9 @@ func serviceVariables(t *testing.T) []string {
 	return names
 }
 
-// clearEnv takes every service variable out of the environment, so that a test
-// starts from a known state rather than from whatever the shell running it
-// happens to hold.
-//
-// t.Setenv first, for the cleanup it registers, and os.Unsetenv after it: an
-// empty value and an absent one travel different branches of the helpers, and
-// this is the absent one.
+// t.Setenv first, for the cleanup it registers, then os.Unsetenv: an empty
+// value and an absent one travel different branches, and this is the absent
+// one.
 func clearEnv(t *testing.T) {
 	t.Helper()
 
@@ -139,12 +129,11 @@ func clearEnv(t *testing.T) {
 	}
 }
 
-// testDatabaseDSN stands in for the one variable that has no default, so that a
-// test about anything else can still get a configuration out of Load.
+// testDatabaseDSN stands in for the one variable that has no default, so that
+// a test about anything else can still get a configuration out of Load.
 const testDatabaseDSN = "postgres://user:pass@localhost:5432/db?sslmode=disable"
 
-// loadWith runs Load over env and nothing else. A name mapped to an empty
-// string is left out of the environment entirely.
+// A name mapped to an empty string is left out of the environment entirely.
 func loadWith(t *testing.T, env map[string]string) (Config, error) {
 	t.Helper()
 
@@ -161,10 +150,10 @@ func loadWith(t *testing.T, env map[string]string) (Config, error) {
 	return Load()
 }
 
-// TestLoadDefaults pins every default to a number. They are the values the
-// service runs with whenever a variable is left out, which is the ordinary case
-// rather than the exceptional one, so a default that drifts is a change of
-// behaviour with nothing else announcing it.
+// Every default to a number. They are the values the service runs with
+// whenever a variable is left out, which is the ordinary case rather than the
+// exceptional one, so a default that drifts is a change of behaviour with
+// nothing else announcing it.
 func TestLoadDefaults(t *testing.T) {
 	cfg, err := loadWith(t, map[string]string{"DATABASE_URL": testDatabaseDSN})
 	require.NoError(t, err)
@@ -195,11 +184,11 @@ func TestLoadDefaults(t *testing.T) {
 	// already the assertion that the defaults hold together.
 }
 
-// TestLoadReadsEveryVariableIntoItsOwnField is what eighteen near-identical
-// lines are worth a test for. Every value below is distinct, so a field reading
-// its neighbour's variable comes back holding the neighbour's value -- a
-// mistake that compiles, that no other test in the project would notice, and
-// that would surface as a recovery pass running on the wrong clock.
+// What eighteen near-identical lines are worth a test for. Every value below
+// is distinct, so a field reading its neighbour's variable comes back holding
+// the neighbour's value -- a mistake that compiles, that no other test in the
+// project would notice, and that would surface as a recovery pass running on
+// the wrong clock.
 func TestLoadReadsEveryVariableIntoItsOwnField(t *testing.T) {
 	cfg, err := loadWith(t, map[string]string{
 		"DATABASE_URL":       testDatabaseDSN,
@@ -252,9 +241,9 @@ func TestLoadReadsEveryVariableIntoItsOwnField(t *testing.T) {
 	}, cfg)
 }
 
-// TestLoadRequiresTheDatabaseURL covers the one variable with no default.
-// Falling back to some arbitrary connection string would start the service
-// against a database nobody meant, which is worse than not starting at all.
+// The one variable with no default. Falling back to some arbitrary connection
+// string would start the service against a database nobody meant, which is
+// worse than not starting at all.
 func TestLoadRequiresTheDatabaseURL(t *testing.T) {
 	t.Run("absent", func(t *testing.T) {
 		_, err := loadWith(t, nil)
@@ -272,10 +261,10 @@ func TestLoadRequiresTheDatabaseURL(t *testing.T) {
 	})
 }
 
-// TestLoadTreatsAnEmptyValueAsUnset covers the shape a variable arrives in
-// through compose: HTTP_PORT: ${HTTP_PORT:-8080} passes an empty string
-// straight through when .env carries a bare "HTTP_PORT=". Read literally that
-// would be a port of zero and a timeout of none.
+// The shape a variable arrives in through compose: HTTP_PORT:
+// ${HTTP_PORT:-8080} passes an empty string straight through when .env carries
+// a bare "HTTP_PORT=". Read literally that would be a port of zero and a
+// timeout of none.
 func TestLoadTreatsAnEmptyValueAsUnset(t *testing.T) {
 	clearEnv(t)
 
@@ -296,17 +285,15 @@ func TestLoadTreatsAnEmptyValueAsUnset(t *testing.T) {
 	require.Equal(t, defaultProviderBaseURL, cfg.ProviderBaseURL)
 }
 
-// TestLoadRejectsBadValues covers what the service refuses to start on.
+// What the service refuses to start on.
 //
-// Two of these are traps rather than typos. A duration of zero is not a
-// tighter timeout but no timeout at all, which is how an invariant of the
-// project -- every outbound call is bounded -- would be lifted by a setting
-// that looks like it does the opposite. A count of zero is a pool of no
-// workers, or a provider allowed no attempts: a service that starts, answers
-// its healthcheck and quietly does nothing.
+// Two of these are traps rather than typos. A duration of zero is no timeout
+// at all, which lifts the invariant that every outbound call is bounded; a
+// count of zero is a pool of no workers, a service that starts, answers its
+// healthcheck and quietly does nothing.
 //
-// Every failure has to name its variable. With eighteen of them, an error
-// saying only that a value is malformed leaves the operator to find out which.
+// Every failure has to name its variable, or the operator is left to find out
+// which of eighteen it was.
 func TestLoadRejectsBadValues(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -350,10 +337,9 @@ func TestLoadRejectsBadValues(t *testing.T) {
 	}
 }
 
-// TestLoadAcceptsTheEdgesOfThePortRange checks that the two ends stay inside.
-// Port zero is excluded on purpose -- it makes the server pick an arbitrary
-// free port, which cannot match the one compose published -- and that
-// exclusion is what makes the lower bound worth stating.
+// The two ends stay inside. Port zero is excluded on purpose -- it makes the
+// server pick an arbitrary free port, which cannot match the one compose
+// published -- and that exclusion is what makes the lower bound worth stating.
 func TestLoadAcceptsTheEdgesOfThePortRange(t *testing.T) {
 	for _, port := range []int{minPort, maxPort} {
 		t.Run(strconv.Itoa(port), func(t *testing.T) {
@@ -368,10 +354,10 @@ func TestLoadAcceptsTheEdgesOfThePortRange(t *testing.T) {
 	}
 }
 
-// TestLoadLogLevelSpellings checks the names an operator is likely to write.
-// The level is parsed by slog rather than by this package, and what it accepts
-// is worth stating: a deployment that set LOG_LEVEL=DEBUG and got a refusal
-// would be a surprise, and one that silently got info would be a worse one.
+// The names an operator is likely to write. The level is parsed by slog rather
+// than by this package, and what it accepts is worth stating: a deployment
+// that set LOG_LEVEL=DEBUG and got a refusal would be a surprise, and one that
+// silently got info would be a worse one.
 func TestLoadLogLevelSpellings(t *testing.T) {
 	tests := []struct {
 		value string
@@ -401,21 +387,19 @@ func TestLoadLogLevelSpellings(t *testing.T) {
 // values in .env.example and the substitutions in docker-compose.yml. Two of
 // those are documentation of the third, and nothing but the tests below keeps
 // any of them in step -- the omission has already happened once, when the
-// idempotency settings reached the code and .env.example but not the container.
+// idempotency settings reached the code and .env.example but not the
+// container.
 //
-// Both checks work the same way: whatever the file says is applied to the
-// environment, Load is run over it, and the result has to be the one an empty
-// environment produces. Comparing configurations rather than strings means
-// neither test has to know how a duration is spelled, and neither holds a copy
-// of a value that could drift on its own.
+// Both checks apply what the file says to the environment and require the
+// result to be what an empty environment produces. Comparing configurations
+// rather than strings means neither test knows how a duration is spelled.
 const (
 	envExamplePath = "../../.env.example"
 	composePath    = "../../docker-compose.yml"
 )
 
-// envFileDefaults reads the KEY=value lines of .env.example. Comments, blank
-// lines and variables left without a value are skipped: the last of those is
-// how the file marks a variable that has no default at all.
+// The last of those is how the file marks a variable that has no default at
+// all.
 func envFileDefaults(t *testing.T) map[string]string {
 	t.Helper()
 
@@ -441,12 +425,10 @@ func envFileDefaults(t *testing.T) map[string]string {
 	return values
 }
 
-// composeDefaults reads the "NAME: ${NAME:-value}" substitutions out of
-// docker-compose.yml.
-//
-// Only that exact shape, which is what makes DATABASE_URL fall out on its own:
-// it is assembled there from the POSTGRES_* values rather than defaulted, so it
-// has no default of its own to compare.
+// ${NAME:-value}" substitutions out of docker-compose.yml. Only that exact
+// shape, which is what makes DATABASE_URL fall out on its own: it is assembled
+// there from the POSTGRES_* values rather than defaulted, so it has no default
+// of its own to compare.
 func composeDefaults(t *testing.T) map[string]string {
 	t.Helper()
 
@@ -470,8 +452,6 @@ func composeDefaults(t *testing.T) map[string]string {
 	return values
 }
 
-// requireLoadsToTheDefaults checks that applying values to the environment
-// yields the configuration an empty environment does.
 func requireLoadsToTheDefaults(t *testing.T, values map[string]string) {
 	t.Helper()
 
@@ -492,18 +472,18 @@ func requireLoadsToTheDefaults(t *testing.T, values map[string]string) {
 	require.Equal(t, defaults, got)
 }
 
-// TestEnvExampleMatchesTheDefaults checks the claim the file opens with -- that
-// its values mirror the ones compiled in. A reader who copies it to .env has to
-// get the service the defaults describe, and an operator reading it to find out
-// what a setting currently is has to be reading the truth.
+// The claim the file opens with -- that its values mirror the ones compiled
+// in. A reader who copies it to .env has to get the service the defaults
+// describe, and an operator reading it to find out what a setting currently is
+// has to be reading the truth.
 func TestEnvExampleMatchesTheDefaults(t *testing.T) {
 	requireLoadsToTheDefaults(t, envFileDefaults(t))
 }
 
-// TestEnvExampleListsEveryVariable is the half the comparison above cannot
-// make. A variable missing from the file loads its default on both sides and
-// the values agree, so only the names can catch it -- and a setting that exists
-// but is written down nowhere is one nobody knows to reach for.
+// The half the comparison above cannot make. A variable missing from the file
+// loads its default on both sides and the values agree, so only the names can
+// catch it -- and a setting that exists but is written down nowhere is one
+// nobody knows to reach for.
 func TestEnvExampleListsEveryVariable(t *testing.T) {
 	documented := envFileDefaults(t)
 
@@ -515,18 +495,16 @@ func TestEnvExampleListsEveryVariable(t *testing.T) {
 	}
 }
 
-// TestComposeMatchesTheDefaults checks the copy that actually runs. The
-// defaults are repeated in the compose file so that a clean clone comes up
-// without an .env beside it, which means an operator reading either file has to
-// find the same service described.
+// The copy that actually runs. The defaults are repeated in the compose file
+// so that a clean clone comes up without an .env beside it, which means an
+// operator reading either file has to find the same service described.
 func TestComposeMatchesTheDefaults(t *testing.T) {
 	requireLoadsToTheDefaults(t, composeDefaults(t))
 }
 
-// TestComposePassesEveryVariable is the omission that has already happened: a
-// setting added to the code and to .env.example, and forgotten in the compose
-// file, leaves the container running on a default nobody chose while both
-// documents say otherwise.
+// The omission that has already happened: a setting added to the code and to
+// .env.example, and forgotten in the compose file, leaves the container
+// running on a default nobody chose while both documents say otherwise.
 func TestComposePassesEveryVariable(t *testing.T) {
 	passed := composeDefaults(t)
 

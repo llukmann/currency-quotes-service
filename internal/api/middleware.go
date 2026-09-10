@@ -23,15 +23,10 @@ const requestIDHeader = "X-Request-Id"
 // can name the type, so nothing can collide with it.
 type requestIDContextKey struct{}
 
-// requestID gives every request an identifier and puts it where the log lines
-// of that request can find it.
-//
-// An incoming X-Request-Id is ignored rather than adopted. Honouring it would
+// An incoming X-Request-Id is ignored rather than adopted: honouring it would
 // put a string of the client's choosing, of any length and any content, into
-// every log line of the request -- and buy nothing here, since there is no
-// second service of ours upstream to correlate with. The identifier is a UUID
-// for the same reason update_id is: two of them side by side in a log line
-// read as the same kind of thing.
+// every log line of the request, and there is no upstream service of ours to
+// correlate with.
 func requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := uuid.NewString()
@@ -41,34 +36,17 @@ func requestID(next http.Handler) http.Handler {
 	})
 }
 
-// requestIDFrom returns the identifier of the request ctx belongs to, or an
-// empty string outside a request.
 func requestIDFrom(ctx context.Context) string {
 	id, _ := ctx.Value(requestIDContextKey{}).(string)
 
 	return id
 }
 
-// accessLog writes one line per request, after it has been answered.
+// Never why: the cause of a failure is logged by writeInternal, which is what
+// lets this line stay at info for every status. A status of zero means the
+// handler wrote nothing at all.
 //
-// It records what was asked and how it ended, never why: a request that failed
-// through no fault of the client is logged with its cause by writeInternal,
-// where the error is still in hand. Keeping the two apart is what lets this
-// line stay at info for every status, including 500 -- the level of a line
-// nobody has to act on.
-//
-// A status of zero means the handler wrote nothing at all. That is what a
-// request abandoned before its first write looks like from here: writeInternal
-// declined to answer a connection that is gone, and net/http had nobody to
-// send its default 200 to either. It is not what every abandoned request looks
-// like -- a client that leaves once the header is out is logged with the status
-// that had already gone, since what was cut short was the body. The info line
-// carrying the same request id is what says a client left, in both cases.
-//
-// The response writer is wrapped here so that the status can be read back
-// afterwards. The wrapper is chi's rather than ours: a hand-rolled one is a
-// dozen lines, and they are exactly the dozen where the pass-through of Flush
-// and ReaderFrom is got wrong.
+// The writer is wrapped so the status can be read back.
 func accessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -93,19 +71,9 @@ func accessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// requestTimeout bounds everything a handler does. Without it a query against
-// a database that has stopped answering holds a goroutine and a pooled
-// connection for as long as the outage lasts: the server's write timeout ends
-// the response but does not cancel the request.
-//
-// It only sets the deadline and writes nothing itself. What the handler was
-// doing then fails with a context error, which is served as internal_error --
-// a code the contract describes, through the envelope the contract describes.
-// chi's own middleware.Timeout was not used for both halves of that: it answers
-// with a bare 504, which the spec lists for no endpoint, and it writes that 504
-// from a deferred call without checking whether the handler has already
-// answered, so a request finishing just as the deadline lands gets a second
-// WriteHeader on top of a response that was already correct.
+// The server's write timeout ends the response but does not cancel the request,
+// so without this a query against a stopped database holds a goroutine and a
+// pooled connection for the length of the outage.
 func requestTimeout(d time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -117,16 +85,12 @@ func requestTimeout(d time.Duration) func(http.Handler) http.Handler {
 	}
 }
 
-// recoverPanic turns a panic in a handler into the 500 the contract promises.
+// net/http recovers a panic too, but logs the stack through its own logger and
+// closes the connection without answering, where the contract shows an
+// envelope.
 //
-// Without it the panic reaches net/http, which recovers it too -- the process
-// survives either way -- but logs the stack through its own logger and closes
-// the connection without answering. A client would see a dropped connection
-// where the contract shows an envelope.
-//
-// It sits inside accessLog rather than around it, so that the panic is turned
-// into a status before the deferred log line reads one. The other way round the
-// line would report a status of zero and the 500 would appear nowhere.
+// Inside accessLog rather than around it, so the panic becomes a status before
+// the deferred log line reads one.
 func recoverPanic(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -151,12 +115,9 @@ func recoverPanic(logger *slog.Logger) func(http.Handler) http.Handler {
 					slog.String("request_id", requestIDFrom(ctx)),
 				)
 
-				// Only if the handler has not answered yet. A panic after a
-				// status has gone out cannot be reported to the client at all:
-				// a second WriteHeader is refused with a complaint of its own,
-				// and the envelope would land inside a body that is already
-				// valid. The wrapper accessLog installed is what makes this
-				// answerable, and is the second reason it is there.
+				// Only if the handler has not answered yet: a second WriteHeader is
+				// refused, and the envelope would land inside a body that is already
+				// valid.
 				if wrapped, ok := w.(middleware.WrapResponseWriter); ok && wrapped.Status() != 0 {
 					return
 				}

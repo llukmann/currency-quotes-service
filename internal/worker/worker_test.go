@@ -61,9 +61,9 @@ type stubRepo struct {
 // release is one call of ReleaseTask together with the state of the context it
 // arrived on, read while the call was in progress.
 //
-// Read rather than kept: the context is cancelled by a deferred call the moment
-// release returns, so a test asking afterwards would find every one of them
-// done and learn nothing.
+// Read rather than kept: the context is cancelled by a deferred call the
+// moment release returns, so a test asking afterwards would find every one of
+// them done and learn nothing.
 type release struct {
 	claim       domain.UpdateTask
 	ctxErr      error
@@ -150,10 +150,9 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
-// TestWorkerClaimAndProcess covers the branches a task can leave process by.
-// Two of them are the point of the whole design: a task is closed only when the
-// answer is final, and a claim is handed back only when this service is the one
-// walking away.
+// The branches a task can leave process by. Two of them are the point of the
+// whole design: a task is closed only when the answer is final, and a claim is
+// handed back only when this service is the one walking away.
 func TestWorkerClaimAndProcess(t *testing.T) {
 	answer := provider.Rate{
 		Value: decimal.RequireFromString("19.6552"),
@@ -297,8 +296,8 @@ func TestWorkerClaimAndProcess(t *testing.T) {
 	}
 }
 
-// TestWorkerClaimAndProcessEmptyQueue checks that an idle queue is a state and
-// not an error: it is what a worker sees most of the time.
+// An idle queue is a state and not an error: it is what a worker sees most of
+// the time.
 func TestWorkerClaimAndProcessEmptyQueue(t *testing.T) {
 	repo := &stubRepo{}
 	rates := &stubProvider{}
@@ -312,9 +311,8 @@ func TestWorkerClaimAndProcessEmptyQueue(t *testing.T) {
 	require.Empty(t, repo.failed)
 }
 
-// TestWorkerClaimAndProcessClaimFails checks that a queue that cannot be
-// reached is reported upwards and touches nothing else. The provider is never
-// called: there is no task to fetch a rate for.
+// A queue that cannot be reached is reported upwards and touches nothing else.
+// The provider is never called: there is no task to fetch a rate for.
 func TestWorkerClaimAndProcessClaimFails(t *testing.T) {
 	repo := &stubRepo{claimErr: errors.New("connection refused")}
 	rates := &stubProvider{}
@@ -326,9 +324,9 @@ func TestWorkerClaimAndProcessClaimFails(t *testing.T) {
 	require.Empty(t, rates.pairs)
 }
 
-// TestWorkerRunStopsWithTheContext checks that a shutdown ends the loop and is
-// not reported as a failure: the group waits on this return value, and an error
-// here would cancel everything else on the way out.
+// A shutdown ends the loop and is not reported as a failure: the group waits
+// on this return value, and an error here would cancel everything else on the
+// way out.
 func TestWorkerRunStopsWithTheContext(t *testing.T) {
 	repo := &stubRepo{}
 
@@ -359,9 +357,8 @@ func (e logEntry) level() slog.Level {
 	return level
 }
 
-// captureLogger returns a logger writing structured records and a function
-// reading back what it has written. It is safe to read while the loops below
-// are still running, which is why the buffer is behind a lock.
+// It is safe to read while the loops below are still running, which is why the
+// buffer is behind a lock.
 func captureLogger() (*slog.Logger, func() []logEntry) {
 	buf := &lockedBuffer{}
 
@@ -407,7 +404,6 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
-// entriesWith returns every record carrying this message.
 func entriesWith(entries []logEntry, msg string) []logEntry {
 	var found []logEntry
 
@@ -420,8 +416,6 @@ func entriesWith(entries []logEntry, msg string) []logEntry {
 	return found
 }
 
-// requireEntry finds the one record with this message and fails the test when
-// there is none.
 func requireEntry(t *testing.T, entries []logEntry, msg string) logEntry {
 	t.Helper()
 
@@ -431,8 +425,7 @@ func requireEntry(t *testing.T, entries []logEntry, msg string) logEntry {
 	return found[0]
 }
 
-// TestWorkerReleaseOutlivesTheCancellationThatCausedIt covers the one context
-// in this package that must not be the caller's.
+// The one context in this package that must not be the caller's.
 //
 // A claim is handed back precisely because the task's context is done -- the
 // service is shutting down -- so a statement issued on that context would fail
@@ -469,15 +462,10 @@ func TestWorkerReleaseOutlivesTheCancellationThatCausedIt(t *testing.T) {
 	require.False(t, released.deadline.After(time.Now().Add(releaseTimeout)))
 }
 
-// TestWorkerLogsTheRawProviderFailure covers the boundary this package is here
-// to hold. The client is told a normalised sentence that names the outcome and
-// not the mechanism, which is only acceptable because the upstream's own words,
-// its URL and its status are written down somewhere -- and this is the one line
-// that ever sees them.
-//
-// Remove it and nothing outside changes: the task fails with the same reason,
-// the same status, the same answer to the client. Only the ability to find out
-// why goes.
+// The client is told a normalised sentence naming the outcome, which is only
+// acceptable because the upstream's own words are written down somewhere, and
+// this is the one line that sees them. Remove it and nothing outside changes:
+// only the ability to find out why goes.
 func TestWorkerLogsTheRawProviderFailure(t *testing.T) {
 	const raw = "fetch rate EUR/MXN: upstream status 503: {\"message\":\"service unavailable\"}"
 
@@ -510,10 +498,10 @@ func TestWorkerLogsTheRawProviderFailure(t *testing.T) {
 	require.NotContains(t, repo.failed[0].reason, "503")
 }
 
-// TestWorkerFinalisationFailures covers what happens when the statement that
-// was supposed to close a task does not go through. None of these can be
-// reported to a client -- the request that queued the task was answered long
-// ago -- so the log is the whole of the outcome.
+// What happens when the statement that was supposed to close a task does not
+// go through. None of these can be reported to a client -- the request that
+// queued the task was answered long ago -- so the log is the whole of the
+// outcome.
 func TestWorkerFinalisationFailures(t *testing.T) {
 	unreachable := errors.New("connection refused")
 
@@ -600,9 +588,9 @@ func TestWorkerFinalisationFailures(t *testing.T) {
 	}
 }
 
-// TestWorkerReleaseFailureIsNotFatal covers the last thing that can go wrong
-// on the way out. The shutdown is not held up for it: the task simply stays in
-// progress, which is the state the recovery pass exists for.
+// The last thing that can go wrong on the way out. The shutdown is not held up
+// for it: the task simply stays in progress, which is the state the recovery
+// pass exists for.
 func TestWorkerReleaseFailureIsNotFatal(t *testing.T) {
 	logger, records := captureLogger()
 
@@ -663,9 +651,6 @@ func (l *loopRepo) FailTask(context.Context, domain.UpdateTask, string) error { 
 
 func (l *loopRepo) ReleaseTask(context.Context, domain.UpdateTask) error { return nil }
 
-// runInBackground starts the loop and returns a function that stops it and
-// waits for it to finish, so no test leaves a goroutine writing to a log a
-// later test reads.
 func runInBackground(t *testing.T, w *Worker) func() {
 	t.Helper()
 
@@ -686,10 +671,10 @@ func runInBackground(t *testing.T, w *Worker) func() {
 	}
 }
 
-// TestWorkerRunReportsAnUnreachableQueueOnce covers the rule that keeps an
-// outage from burying itself. Every worker polls, so four of them at a one
-// second interval write four lines a second for as long as the database is
-// away -- and the incident is then somewhere inside its own symptom.
+// The rule that keeps an outage from burying itself. Every worker polls, so
+// four of them at a one second interval write four lines a second for as long
+// as the database is away -- and the incident is then somewhere inside its own
+// symptom.
 //
 // The first failure is reported and the rest are counted. What is checked here
 // is that silence: the repeat a minute later is left to the clock, and no test
@@ -717,9 +702,9 @@ func TestWorkerRunReportsAnUnreachableQueueOnce(t *testing.T) {
 	require.Equal(t, 1, reported[0].FailedPolls)
 }
 
-// TestWorkerRunReportsTheRecovery covers the other end of the same rule. The
-// count is what says how long the outage went on, and it is the only figure
-// that does: the single line at the start of it cannot know.
+// The other end of the same rule. The count is what says how long the outage
+// went on, and it is the only figure that does: the single line at the start
+// of it cannot know.
 func TestWorkerRunReportsTheRecovery(t *testing.T) {
 	logger, records := captureLogger()
 
@@ -749,9 +734,8 @@ func TestWorkerRunReportsTheRecovery(t *testing.T) {
 	require.Equal(t, failures, recovered.FailedPolls, "the recovery did not report what was lost")
 }
 
-// TestWorkerRunWakesOnASignal covers what makes the service feel immediate. A
-// posted task signals the pool, and an idle worker claims it at once instead of
-// waiting out the poll interval.
+// What makes the service feel immediate. A posted task signals the pool, and
+// an idle worker claims it at once instead of waiting out the poll interval.
 //
 // The interval here is longer than the test is willing to wait, so a claim
 // arriving at all is the assertion: polling cannot be what produced it.
@@ -778,10 +762,9 @@ func TestWorkerRunWakesOnASignal(t *testing.T) {
 		5*time.Second, time.Millisecond, "the signal did not wake an idle worker")
 }
 
-// TestWorkerRunClaimsAgainWithoutWaiting covers the other half of the loop: a
-// worker that found work asks for more straight away, and only an empty queue
-// is worth waiting on. Without it a backlog would drain at one task per
-// interval however many workers were free.
+// The other half of the loop: a worker that found work asks for more straight
+// away, and only an empty queue is worth waiting on. Without it a backlog
+// would drain at one task per interval however many workers were free.
 func TestWorkerRunClaimsAgainWithoutWaiting(t *testing.T) {
 	const queued = 5
 

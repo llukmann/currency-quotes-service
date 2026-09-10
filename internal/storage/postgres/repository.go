@@ -15,37 +15,22 @@ import (
 	"github.com/llukmann/currency-quotes-service/internal/domain"
 )
 
-// Repository is the whole of the service's persistence: the queue of update
-// tasks and the quotes they produce. The two tables sit behind one type
-// because the quotes table is written only by the finalisation of a task, and
-// because every statement that moves a task between statuses then lives in one
-// file and can be read as a set -- each of them has to carry
+// Every statement here that moves a task between statuses has to carry
 // updated_at = now(), and nothing in the schema enforces that.
 type Repository struct {
 	pool *pgxpool.Pool
-	// keyTTL is how long a binding between an idempotency key and its task
-	// holds. Nothing deletes an expired one: the lookup stops seeing it and the
+	// Nothing deletes an expired binding: the lookup stops seeing it, and the
 	// next post carrying that key takes the row over.
 	keyTTL time.Duration
 }
 
-// pingTimeout bounds the one call this package makes before the service is
-// serving. Compose already gates the service on the postgres healthcheck, so it
-// only has to cover an unreachable or misconfigured host, not a slow boot.
+// Compose already gates the service on the postgres healthcheck, so this only
+// has to cover an unreachable or misconfigured host, not a slow boot.
 const pingTimeout = 10 * time.Second
 
-// New opens a pool against databaseURL and returns a repository over it. The
-// pool is sized by pool_max_conns in the connection string, so there is no
-// setting of ours to pass here.
-//
 // The pool opens its connections on demand, so one is asked for here: without
 // it a host that cannot be reached at all would first be reported as a failed
 // request, long after the start it should have stopped.
-//
-// keyTTL is how long an idempotency key stays bound to the task it was answered
-// with.
-//
-// The caller closes the repository, which closes the pool.
 func New(ctx context.Context, databaseURL string, keyTTL time.Duration) (*Repository, error) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
@@ -64,45 +49,28 @@ func New(ctx context.Context, databaseURL string, keyTTL time.Duration) (*Reposi
 	return &Repository{pool: pool, keyTTL: keyTTL}, nil
 }
 
-// Close releases the pool and waits for the connections in use to be returned.
 func (r *Repository) Close() {
 	r.pool.Close()
 }
 
-// querier is the part of pgx that does not care whether it is addressing the
-// pool or a transaction, so that one statement can be issued from either.
+// So one statement can be issued from either the pool or a transaction.
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// CreateTask queues a refresh of pair and returns the task that answers the
-// request, which is not always a new one. The identifier and the timestamps
-// come from the database, so what comes back is the row a client will later be
-// shown.
+// The task returned is not always a new one: an unfinished task for the same
+// pair, or a live idempotency key, is answered with the task that exists.
 //
-// Two things deduplicate here and they cover different windows. The partial
-// unique index on pair catches posts colliding while a task is unfinished,
-// whoever sent them; the key catches one client sending the same request twice,
-// which is the commoner case -- a task is usually finished long before a client
-// gets round to retrying.
-//
-// key is nil when no Idempotency-Key was sent, and then one statement does the
-// whole job. With a key the task and the binding are written in a single
-// transaction, so that rolling back takes the task with it: were the binding
-// written afterwards, a lost race would leave a task behind whose identifier
-// reached nobody and which nobody will ever ask about.
-//
-// Returns domain.ErrKeyConflict if the key is already bound to a task for a
-// different pair.
+// The task and its binding are written in one transaction, so that rolling back
+// takes the task with it: written afterwards, a lost race would leave a task
+// whose identifier reached nobody.
 func (r *Repository) CreateTask(ctx context.Context, pair domain.Pair, key *uuid.UUID) (domain.UpdateTask, error) {
 	if key == nil {
 		return insertTask(ctx, r.pool, pair)
 	}
 
-	// A fast path and nothing more: it answers the repeat arriving seconds
-	// later, which is the case the whole mechanism exists for, without opening
-	// a transaction to find out. What makes the answer right when two requests
-	// race is the unique constraint below, never this read.
+	// A fast path and nothing more. What makes the answer right when two
+	// requests race is the constraint below, never this read.
 	task, found, err := r.taskByKey(ctx, *key)
 	if err != nil {
 		return domain.UpdateTask{}, err
@@ -114,7 +82,6 @@ func (r *Repository) CreateTask(ctx context.Context, pair domain.Pair, key *uuid
 	return r.createTaskWithKey(ctx, pair, *key)
 }
 
-// createTaskWithKey writes the task and the binding to it as one unit.
 func (r *Repository) createTaskWithKey(ctx context.Context, pair domain.Pair, key uuid.UUID) (domain.UpdateTask, error) {
 	// Three outcomes in one statement. No row for this key: it is bound here.
 	// A row past its lifetime: it is taken over, which is the only thing that
@@ -156,13 +123,12 @@ func (r *Repository) createTaskWithKey(ctx context.Context, pair domain.Pair, ke
 		return task, nil
 
 	case errors.Is(err, pgx.ErrNoRows):
-		// Somebody holds this key. Rolling back drops the task written a moment
-		// ago along with it, which is the whole reason both are here.
+		// Rolling back drops the task written a moment ago along with it, which
+		// is the whole reason both are here.
 		//
 		// The holder has committed by now, and that is not an assumption: a
 		// statement conflicting with an uncommitted duplicate waits for the
-		// other transaction to end, so arriving here means it ended by
-		// committing rather than by rolling back.
+		// other transaction to end.
 		if err := tx.Rollback(ctx); err != nil {
 			return domain.UpdateTask{}, fmt.Errorf("create task: rollback: %w", err)
 		}
@@ -174,7 +140,6 @@ func (r *Repository) createTaskWithKey(ctx context.Context, pair domain.Pair, ke
 	}
 }
 
-// replayByKey answers a post whose key turned out to be bound already.
 func (r *Repository) replayByKey(ctx context.Context, key uuid.UUID, pair domain.Pair) (domain.UpdateTask, error) {
 	task, found, err := r.taskByKey(ctx, key)
 	if err != nil {
@@ -183,18 +148,17 @@ func (r *Repository) replayByKey(ctx context.Context, key uuid.UUID, pair domain
 	if !found {
 		// The two statements read the clock at two instants, so a binding that
 		// held when the insert refused it can be expired by the time of this
-		// read. Reported rather than retried around: the window is the width of
-		// one round trip at the far end of a lifetime measured in hours, and a
-		// retry loop here would be machinery for a case nobody will meet.
+		// read. Reported rather than retried around: the window is one round
+		// trip at the far end of a lifetime measured in hours.
 		return domain.UpdateTask{}, fmt.Errorf("create task: key %s is held but binds no task", key)
 	}
 
 	return replayTask(task, pair)
 }
 
-// replayTask answers with the task a key is bound to, provided it was the same
-// request. The pair of the bound task is enough to tell, since a key is only
-// ever bound to a task queued for the pair it arrived with.
+// The pair of the bound task is enough to tell whether it was the same
+// request: a key is only ever bound to a task queued for the pair it arrived
+// with.
 func replayTask(task domain.UpdateTask, pair domain.Pair) (domain.UpdateTask, error) {
 	if task.Pair != pair {
 		return domain.UpdateTask{}, domain.ErrKeyConflict
@@ -203,16 +167,8 @@ func replayTask(task domain.UpdateTask, pair domain.Pair) (domain.UpdateTask, er
 	return task, nil
 }
 
-// taskByKey returns the task an idempotency key is bound to. The join is what
-// keeps the answer to one round trip, and it is also what keeps it current: the
-// status served beside the identifier has to be the one the task carries now,
-// not the one it was created in.
-//
 // Age is part of the condition, and this is where the lifetime of a binding is
-// enforced: nothing deletes an expired row, the lookup simply stops seeing it.
-// Measured by the database clock, as every other age in this file, so that the
-// cutoff is weighed against the timestamps it is compared with rather than
-// against this container's idea of now.
+// enforced: nothing deletes an expired row, the lookup stops seeing it.
 func (r *Repository) taskByKey(ctx context.Context, key uuid.UUID) (domain.UpdateTask, bool, error) {
 	const query = `
 		SELECT u.id, u.pair, u.status, u.attempts, COALESCE(u.error, ''), u.created_at, u.updated_at
@@ -233,18 +189,13 @@ func (r *Repository) taskByKey(ctx context.Context, key uuid.UUID) (domain.Updat
 	return task, true, nil
 }
 
-// insertTask queues a refresh of pair, or answers with the unfinished task that
-// already covers it.
+// The conflict is resolved by an update that changes nothing, purely so the
+// statement has a row to return: DO NOTHING returns none, and a second query
+// opens a window in which the other task finishes.
 //
-// The conflict is resolved by an update that changes nothing, purely so that
-// the statement has a row to return. DO NOTHING returns none, and fetching the
-// other task with a second query opens a window in which that task finishes --
-// whereupon the query finds nothing and the whole thing starts over.
-//
-// What the assignment must never touch is updated_at. For a task in progress
-// that column is the recovery pass's clock, and posts on a busy pair would push
-// the threshold ahead of itself for as long as they kept arriving, leaving a
-// task abandoned by a dead worker to sit in progress forever.
+// What it must never touch is updated_at. For a task in progress that column is
+// the recovery pass's clock, and posts on a busy pair would push the threshold
+// ahead of itself for as long as they kept arriving.
 func insertTask(ctx context.Context, q querier, pair domain.Pair) (domain.UpdateTask, error) {
 	const query = `
 		INSERT INTO quote_updates (pair)
@@ -261,14 +212,9 @@ func insertTask(ctx context.Context, q querier, pair domain.Pair) (domain.Update
 	return t, nil
 }
 
-// GetTask returns the task and, once it has completed successfully, the rate it
-// produced. It backs GET /quotes/updates/{id}, the endpoint a client polls, and
-// that is its only caller: a worker carries its task in hand and never reads it
-// back. The join keeps the answer to a single round trip, and a quote row
-// exists for precisely the tasks in StatusDone, since the finalisation writes
-// both in one transaction.
-//
-// Returns domain.ErrNotFound if no such task exists.
+// A quote row exists for precisely the tasks in StatusDone, since the
+// finalisation writes both in one transaction, so the join answers in a single
+// round trip.
 func (r *Repository) GetTask(ctx context.Context, id uuid.UUID) (domain.TaskDetails, error) {
 	const query = `
 		SELECT u.id, u.pair, u.status, u.attempts, COALESCE(u.error, ''), u.created_at, u.updated_at,
@@ -319,10 +265,6 @@ func (r *Repository) GetTask(ctx context.Context, id uuid.UUID) (domain.TaskDeta
 	return d, nil
 }
 
-// GetLatestQuote returns the most recently fetched rate for pair, whichever
-// task produced it.
-//
-// Returns domain.ErrNotFound if the pair has never been quoted.
 func (r *Repository) GetLatestQuote(ctx context.Context, pair domain.Pair) (domain.Quote, error) {
 	// Ordered by fetched_at rather than rate_date: a weekend leaves several
 	// rows sharing one rate_date, and their order would be undefined. Both the
@@ -354,24 +296,16 @@ func (r *Repository) GetLatestQuote(ctx context.Context, pair domain.Pair) (doma
 	return q, nil
 }
 
-// ClaimTask takes the oldest waiting task, marks it in progress and returns it.
-// The second result is false when there is nothing to do, which is the normal
-// state of an idle worker rather than an error.
+// Selecting and marking are one statement on purpose: apart, another worker
+// reads the row in between and the provider is called twice for one task.
+// SKIP LOCKED is what keeps a pool from queueing up behind the oldest row.
 //
-// Selecting and marking are one statement on purpose: read the row first and
-// mark it second, and another worker reads it in between, so the provider is
-// called twice for one task. SKIP LOCKED is what makes a pool of workers worth
-// having -- without it they would queue up behind the same oldest row and run
-// as one.
-//
-// The row lock lasts only until this statement's transaction commits, so from
-// then on the only thing saying the task is taken is its status. That is why
-// the recovery pass has to exist, and why CompleteTask and FailTask have to
-// prove the claim they hold is still current.
+// The row lock lasts only until this statement commits, so from then on the
+// only thing saying the task is taken is its status -- which is why the
+// recovery pass exists and why finalising has to prove its claim.
 func (r *Repository) ClaimTask(ctx context.Context) (domain.UpdateTask, bool, error) {
 	// attempts is incremented here rather than on failure: it counts how many
-	// times processing was started, which is what bounds the recovery loop, and
-	// it identifies this particular claim to the finalisation below.
+	// times processing was started, which is what the recovery pass bounds.
 	const query = `
 		UPDATE quote_updates
 		   SET status     = 'in_progress',
@@ -398,21 +332,15 @@ func (r *Repository) ClaimTask(ctx context.Context) (domain.UpdateTask, bool, er
 	return t, true, nil
 }
 
-// CompleteTask stores the fetched rate and closes the task in one transaction:
-// a quote whose task is not finished would be served by GET /quotes/latest
-// under a task that still claims to be running.
+// One transaction: a quote whose task is not finished would be served by
+// GET /quotes/latest under a task that still claims to be running.
 //
-// claim must be the task as ClaimTask returned it. Its attempts value
-// identifies that claim, and the statement matches on it, so a worker whose
-// task was taken away by the recovery pass -- and possibly claimed by someone
-// else since, which restores the status and leaves a status check alone
-// useless -- changes nothing and gets domain.ErrStaleClaim. This match is what
-// carries the guarantee; the staleness threshold only decides how often the
-// case arises, since it weighs a budget measured by this process against wall
-// time measured by the database.
+// claim must be the task as ClaimTask returned it: its attempts value
+// identifies the claim, and matching on it is what a status check cannot do,
+// since a task taken away and claimed again carries the status back.
 //
-// The task is closed before the quote is inserted, so that a lost claim leaves
-// no row behind in quotes.
+// The task is closed before the quote is inserted, so a lost claim leaves no
+// row behind in quotes.
 func (r *Repository) CompleteTask(
 	ctx context.Context,
 	claim domain.UpdateTask,
@@ -427,9 +355,8 @@ func (r *Repository) CompleteTask(
 		       updated_at = now()
 		 WHERE id = $1 AND status = 'in_progress' AND attempts = $2`
 
-	// pair is copied from the claim, which is the only source of it here: the
-	// denormalised column cannot drift from the task it belongs to. The rate
-	// crosses as text, so no binary float is involved on the way into numeric.
+	// pair is copied from the claim rather than joined: the row it came from is
+	// the one being closed in this same transaction.
 	const insertQuote = `
 		INSERT INTO quotes (update_id, pair, rate, rate_date, fetched_at)
 		VALUES ($1, $2, $3::numeric, $4, $5)`
@@ -459,14 +386,11 @@ func (r *Repository) CompleteTask(
 	return nil
 }
 
-// FailTask closes the task as failed with reason, which is served to clients as
-// is: it has to be a normalised message, never a raw provider error or an
-// upstream URL. The caller owns that wording, since what a client reads is a
-// decision of the layer above this one.
+// reason is served to clients as is, so it has to be a normalised message,
+// never a raw provider error or an upstream URL. The caller owns that wording.
 //
-// claim carries the same proof of ownership as in CompleteTask, and a lost
-// claim is reported the same way. Failing a task that is no longer ours would
-// overwrite the state of whoever holds it now.
+// claim carries the same proof of ownership as CompleteTask: failing a task
+// that is no longer ours would overwrite the state of whoever holds it now.
 func (r *Repository) FailTask(ctx context.Context, claim domain.UpdateTask, reason string) error {
 	const query = `
 		UPDATE quote_updates
@@ -476,7 +400,7 @@ func (r *Repository) FailTask(ctx context.Context, claim domain.UpdateTask, reas
 		 WHERE id = $1 AND status = 'in_progress' AND attempts = $2`
 
 	// The schema requires a failed task to carry a reason; an empty string
-	// satisfies that constraint while telling a client nothing.
+	// would pass that and tell a client nothing.
 	if reason == "" {
 		return fmt.Errorf("fail task %s: reason is empty", claim.ID)
 	}
@@ -492,17 +416,11 @@ func (r *Repository) FailTask(ctx context.Context, claim domain.UpdateTask, reas
 	return nil
 }
 
-// ReleaseTask puts a claimed task back in the queue, for a worker that is
-// giving it up rather than finishing it: on shutdown the task did not fail and
-// nobody is at fault, so failing it would tell a client the provider was.
+// For a worker giving a task up rather than finishing it: on shutdown the task
+// did not fail, so failing it would tell a client the provider was at fault.
 //
-// claim carries the same proof of ownership as the two above, and for the same
-// reason: without it a worker leaving late would take the task away from
-// whoever claimed it after the recovery pass released it.
-//
-// attempts is not decremented. It counts how many times processing was
-// started, and one start did happen; the recovery pass leaves it alone for the
-// same reason, and the next claim is what moves it on.
+// attempts is not decremented. It counts how many times processing was started,
+// and one start did happen.
 func (r *Repository) ReleaseTask(ctx context.Context, claim domain.UpdateTask) error {
 	const query = `
 		UPDATE quote_updates
@@ -521,39 +439,25 @@ func (r *Repository) ReleaseTask(ctx context.Context, claim domain.UpdateTask) e
 	return nil
 }
 
-// ReleaseStuckTasks deals with tasks left in progress by a worker that died
-// before finalising them: nothing releases those on their own, since the row
-// lock disappeared along with the process. A task counts as stuck once it has
-// been in progress for longer than olderThan.
+// Nothing releases a stuck task on its own: the row lock disappeared with the
+// process that held it. Those under maxAttempts go back to the queue, the rest
+// are closed as failed, which stops a task that reliably kills its worker from
+// cycling forever.
 //
-// Tasks below maxAttempts go back to the queue; those that have reached it are
-// closed as failed with reason, which is what stops a task that reliably kills
-// its worker from cycling between claim and release forever. All three are
-// settings rather than constants, and they arrive as arguments because the
-// caller is the one holding the configuration: how long to wait, how many
-// claims to allow and what to tell a client are not decisions for storage.
+// The counts are returned apart because they mean different things: releases
+// say workers are dying, a failure says one task keeps killing whoever picks it
+// up.
 //
-// The two counts are returned apart because they mean different things to
-// whoever logs them. A steady trickle of releases says workers are dying or
-// that the threshold is too tight; a failure says one task keeps killing
-// whoever picks it up. A single total would hide both.
-//
-// The two statements share one transaction so that both partition the table at
-// the same instant: now() is the transaction's start time, not the statement's.
-// Age is measured by the database clock throughout -- a cutoff computed here
-// would weigh the database's timestamps against this container's clock.
+// One transaction for both statements, so they partition the table at the same
+// instant -- now() is the transaction's start time, not the statement's.
 func (r *Repository) ReleaseStuckTasks(
 	ctx context.Context,
 	olderThan time.Duration,
 	maxAttempts int,
 	reason string,
 ) (released, failed int, err error) {
-	// The cutoff is now() minus an interval built from $1 seconds. Written this
-	// way the column stays bare on the left and the right side is one value for
-	// the whole transaction, so the partial index on updated_at serves the
-	// condition as a range. Turned around -- extracting each row's age and
-	// comparing that to $1 -- it would be an expression over the column, and
-	// every row would have to be computed.
+	// The cutoff is now() minus an interval built from $1 seconds, so the age
+	// is measured by the database clock rather than this container's.
 	const releaseQuery = `
 		UPDATE quote_updates
 		   SET status     = 'pending',
@@ -602,8 +506,7 @@ func (r *Repository) ReleaseStuckTasks(
 	return int(releaseTag.RowsAffected()), int(abandonTag.RowsAffected()), nil
 }
 
-// scanTask reads the columns of quote_updates in the order the queries above
-// list them.
+// The column order below is the order every query above selects in.
 func scanTask(row pgx.Row) (domain.UpdateTask, error) {
 	var t domain.UpdateTask
 

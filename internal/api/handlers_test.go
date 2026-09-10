@@ -101,8 +101,6 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.DiscardHandler)
 }
 
-// serve runs one request through the real router, middleware included, which is
-// the path a client's request actually takes.
 func serve(t *testing.T, svc quoteService, r *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
 
@@ -112,8 +110,7 @@ func serve(t *testing.T, svc quoteService, r *http.Request) *httptest.ResponseRe
 	return w
 }
 
-// requireEnvelope checks a response against the single error shape of the API:
-// a client branches on the code, so the code is what a test pins.
+// A client branches on the code, so the code is what a test pins.
 func requireEnvelope(t *testing.T, w *httptest.ResponseRecorder, status int, code contract.ErrorCode) {
 	t.Helper()
 
@@ -126,8 +123,6 @@ func requireEnvelope(t *testing.T, w *httptest.ResponseRecorder, status int, cod
 	require.NotEmpty(t, got.Error.Message)
 }
 
-// testTask is a queued task with a fixed identifier, so that a test can name
-// the value it expects in the body.
 func testTask(status domain.Status) domain.UpdateTask {
 	return domain.UpdateTask{
 		ID:       uuid.MustParse("6f1a2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d"),
@@ -137,11 +132,11 @@ func testTask(status domain.Status) domain.UpdateTask {
 	}
 }
 
-// TestCreateTaskAccepted covers what a post answers with, including the two
-// cases where the task in the body is not the one this request created: a
-// replayed key and a post that landed on a refresh already running. The status
-// served is the one the row carries now, which is how a client retrying after a
-// failure learns to send a fresh key instead of polling forever.
+// What a post answers with, including the two cases where the task in the body
+// is not the one this request created: a replayed key and a post that landed
+// on a refresh already running. The status served is the one the row carries
+// now, which is how a client retrying after a failure learns to send a fresh
+// key instead of polling forever.
 func TestCreateTaskAccepted(t *testing.T) {
 	key := uuid.MustParse("0a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d")
 
@@ -226,10 +221,10 @@ func TestCreateTaskAccepted(t *testing.T) {
 	}
 }
 
-// TestCreateTaskRefused covers every way a post is turned away. The codes are
-// the point: 400 says the request is wrong and 409 says the request is fine but
-// the history behind the key is not, and a client reading the code alone has to
-// be able to tell those apart.
+// Every way a post is turned away. The codes are the point: 400 says the
+// request is wrong and 409 says the request is fine but the history behind the
+// key is not, and a client reading the code alone has to be able to tell those
+// apart.
 func TestCreateTaskRefused(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -331,9 +326,9 @@ func TestCreateTaskRefused(t *testing.T) {
 	}
 }
 
-// TestCreateTaskHidesTheCause checks where a failure of ours stops. A driver's
-// message, a statement or a connection string says nothing to whoever made the
-// request and something to whoever did not, so the client gets the code alone.
+// Where a failure of ours stops. A driver's message, a statement or a
+// connection string says nothing to whoever made the request and something to
+// whoever did not, so the client gets the code alone.
 func TestCreateTaskHidesTheCause(t *testing.T) {
 	svc := &fakeService{createErr: errors.New(`dial tcp 10.0.0.7:5432: connect: connection refused`)}
 
@@ -348,9 +343,9 @@ func TestCreateTaskHidesTheCause(t *testing.T) {
 	require.Contains(t, body, internalErrorMessage)
 }
 
-// TestGetTask covers the endpoint a client polls. An unfinished task is a 200
-// carrying the status it is actually in, never a 404: the update exists, and
-// saying it does not would tell a client to stop asking.
+// The endpoint a client polls. An unfinished task is a 200 carrying the status
+// it is actually in, never a 404: the update exists, and saying it does not
+// would tell a client to stop asking.
 func TestGetTask(t *testing.T) {
 	id := uuid.MustParse("6f1a2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d")
 
@@ -447,8 +442,8 @@ func TestGetTask(t *testing.T) {
 	}
 }
 
-// TestGetTaskRefused covers the two ways a poll fails: an identifier that is
-// not one, which never reaches the service, and one that names no task.
+// The two ways a poll fails: an identifier that is not one, which never
+// reaches the service, and one that names no task.
 func TestGetTaskRefused(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -495,9 +490,9 @@ func TestGetTaskRefused(t *testing.T) {
 	}
 }
 
-// TestGetLatestQuote covers the read that answers from the database alone. Both
-// timestamps are served: rate_date says how old the rate is, fetched_at when
-// this service last confirmed it, and over a weekend they differ by days.
+// The read that answers from the database alone. Both timestamps are served:
+// rate_date says how old the rate is, fetched_at when this service last
+// confirmed it, and over a weekend they differ by days.
 func TestGetLatestQuote(t *testing.T) {
 	svc := &fakeService{quote: domain.Quote{
 		UpdateID:  uuid.MustParse("6f1a2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d"),
@@ -521,9 +516,9 @@ func TestGetLatestQuote(t *testing.T) {
 	require.Equal(t, []domain.Pair{"EUR/MXN"}, svc.looked)
 }
 
-// TestGetLatestQuoteReadsTheParameter checks what arrives at the service. A
-// percent-encoded separator is what a correct client sends, and Query unescapes
-// it for us, so both spellings have to reach the service as the same pair.
+// What arrives at the service. A percent-encoded separator is what a correct
+// client sends, and Query unescapes it for us, so both spellings have to reach
+// the service as the same pair.
 func TestGetLatestQuoteReadsTheParameter(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -546,9 +541,9 @@ func TestGetLatestQuoteReadsTheParameter(t *testing.T) {
 	}
 }
 
-// TestGetLatestQuoteRefused keeps the two 4xx apart on purpose: an unsupported
-// pair will never work, while a supported one that has not been quoted yet will
-// as soon as an update completes.
+// The two 4xx apart on purpose: an unsupported pair will never work, while a
+// supported one that has not been quoted yet will as soon as an update
+// completes.
 func TestGetLatestQuoteRefused(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -605,9 +600,8 @@ func TestGetLatestQuoteRefused(t *testing.T) {
 	}
 }
 
-// TestRouterRecoversFromAPanic checks that a panic reaches the client as the
-// envelope the contract promises rather than as a dropped connection, which is
-// what net/http's own recovery would leave.
+// A panic reaches the client as the envelope the contract promises rather than
+// as a dropped connection, which is what net/http's own recovery would leave.
 func TestRouterRecoversFromAPanic(t *testing.T) {
 	svc := &fakeService{before: func(context.Context) { panic("something in the service gave way") }}
 
@@ -617,9 +611,9 @@ func TestRouterRecoversFromAPanic(t *testing.T) {
 	requireEnvelope(t, w, http.StatusInternalServerError, contract.ErrorCodeInternalError)
 }
 
-// TestRouterAppliesTheRequestDeadline checks that a handler cannot outlive its
-// deadline: without one a query against a database that has stopped answering
-// holds a goroutine and a pooled connection for as long as the outage lasts.
+// A handler cannot outlive its deadline: without one a query against a
+// database that has stopped answering holds a goroutine and a pooled
+// connection for as long as the outage lasts.
 //
 // The service waits for the deadline rather than for a duration, so the expiry
 // is a fact rather than a race with a timer.
@@ -639,11 +633,10 @@ func TestRouterAppliesTheRequestDeadline(t *testing.T) {
 	requireEnvelope(t, w, http.StatusInternalServerError, contract.ErrorCodeInternalError)
 }
 
-// TestRouterAnswersNothingToAClientThatLeft checks the one failure that is not
-// answered at all. Everything in flight fails when the connection goes away,
-// but that is the consequence of the client leaving rather than a fault of
-// ours, and writing a status into a connection that is gone reports it to
-// nobody.
+// The one failure that is not answered at all. Everything in flight fails when
+// the connection goes away, but that is the consequence of the client leaving
+// rather than a fault of ours, and writing a status into a connection that is
+// gone reports it to nobody.
 func TestRouterAnswersNothingToAClientThatLeft(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 
@@ -663,9 +656,8 @@ func TestRouterAnswersNothingToAClientThatLeft(t *testing.T) {
 	require.Empty(t, w.Body.String())
 }
 
-// TestRouterSetsARequestID checks that every business response carries the
-// identifier its log lines are written under: it is the only way a client can
-// quote one when reporting a problem.
+// Every business response carries the identifier its log lines are written
+// under: it is the only way a client can quote one when reporting a problem.
 func TestRouterSetsARequestID(t *testing.T) {
 	svc := &fakeService{task: testTask(domain.StatusPending)}
 
@@ -683,9 +675,9 @@ func TestRouterSetsARequestID(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestHealthzStaysOutsideTheGroup checks that the probe is answered without any
-// of the middleware. The compose healthcheck calls it every five seconds, and
-// an access log line each time would bury anything worth reading.
+// The probe is answered without any of the middleware. The compose healthcheck
+// calls it every five seconds, and an access log line each time would bury
+// anything worth reading.
 func TestHealthzStaysOutsideTheGroup(t *testing.T) {
 	w := serve(t, &fakeService{}, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
@@ -694,9 +686,9 @@ func TestHealthzStaysOutsideTheGroup(t *testing.T) {
 	require.Empty(t, w.Header().Get(requestIDHeader), "the probe went through the middleware group")
 }
 
-// TestRouterServesNoOtherEndpoints holds the surface to the three the contract
-// describes plus the probe. The check is here rather than in a document because
-// a fourth route is added in this package.
+// The surface to the three the contract describes plus the probe. The check is
+// here rather than in a document because a fourth route is added in this
+// package.
 func TestRouterServesNoOtherEndpoints(t *testing.T) {
 	tests := []struct {
 		method string
@@ -721,9 +713,8 @@ func TestRouterServesNoOtherEndpoints(t *testing.T) {
 	}
 }
 
-// TestCreateTaskReadsNoMoreThanTheLimit checks that an oversized body is
-// refused rather than buffered: the reader stops at the limit, so the rest of
-// what a client sent is never held in memory.
+// An oversized body is refused rather than buffered: the reader stops at the
+// limit, so the rest of what a client sent is never held in memory.
 func TestCreateTaskReadsNoMoreThanTheLimit(t *testing.T) {
 	body := &countingReader{r: strings.NewReader(`{"pair":"` + strings.Repeat("E", 1<<20) + `"}`)}
 
@@ -749,8 +740,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// boolToInt renders an expectation about the service as the number of calls it
-// should have seen: one or none.
+// One or none.
 func boolToInt(b bool) int {
 	if b {
 		return 1
@@ -785,9 +775,6 @@ func (e logEntry) level() slog.Level {
 	return level
 }
 
-// captureLogger returns a logger writing structured records, and a function
-// reading back what it has written so far.
-//
 // The tests that use it are the ones about the log itself. Everywhere else the
 // discard logger stays: what a handler answers and what it writes down are
 // separate questions, and only the second needs this.
@@ -816,8 +803,6 @@ func captureLogger() (*slog.Logger, func() []logEntry) {
 	}
 }
 
-// requireEntry finds the one record with this message and fails the test when
-// there is none.
 func requireEntry(t *testing.T, entries []logEntry, msg string) logEntry {
 	t.Helper()
 
@@ -832,11 +817,11 @@ func requireEntry(t *testing.T, entries []logEntry, msg string) logEntry {
 	return logEntry{}
 }
 
-// TestLogRecordsTheCauseOfAFailure is the other half of the rule
-// TestCreateTaskHidesTheCause states. The client is told the code alone, which
-// only works because the cause is written down somewhere -- and nothing else
-// in this package would notice if it were not: the answer is identical either
-// way, and the request would become unexplainable rather than merely opaque.
+// The other half of the rule TestCreateTaskHidesTheCause states. The client is
+// told the code alone, which only works because the cause is written down
+// somewhere -- and nothing else in this package would notice if it were not:
+// the answer is identical either way, and the request would become
+// unexplainable rather than merely opaque.
 func TestLogRecordsTheCauseOfAFailure(t *testing.T) {
 	const cause = "dial tcp 10.0.0.7:5432: connect: connection refused"
 
@@ -861,12 +846,11 @@ func TestLogRecordsTheCauseOfAFailure(t *testing.T) {
 	require.NotEmpty(t, entry.RequestID)
 }
 
-// TestLogRecordsAnAbandonedRequestAtInfo pins the level, which is the whole of
-// the decision. Nothing of ours failed: there is no answer to write and nobody
-// to write it to. At error the line would sit in the error log beside a real
-// outage, to be told apart by hand at exactly the moment nobody has time for
-// it -- a closed tab and a database that has stopped answering would look
-// alike.
+// The level, which is the whole of the decision. Nothing of ours failed: there
+// is no answer to write and nobody to write it to. At error the line would sit
+// in the error log beside a real outage, to be told apart by hand at exactly
+// the moment nobody has time for it -- a closed tab and a database that has
+// stopped answering would look alike.
 func TestLogRecordsAnAbandonedRequestAtInfo(t *testing.T) {
 	logger, records := captureLogger()
 
@@ -895,10 +879,10 @@ func TestLogRecordsAnAbandonedRequestAtInfo(t *testing.T) {
 	}
 }
 
-// TestAccessLogReportsTheStatusOfARecoveredPanic is why recoverPanic sits
-// inside accessLog rather than around it. The other way round the panic would
-// pass the access log on its way out, the line would report a status of zero,
-// and the 500 the client actually received would appear nowhere.
+// Why recoverPanic sits inside accessLog rather than around it. The other way
+// round the panic would pass the access log on its way out, the line would
+// report a status of zero, and the 500 the client actually received would
+// appear nowhere.
 func TestAccessLogReportsTheStatusOfARecoveredPanic(t *testing.T) {
 	logger, records := captureLogger()
 
@@ -915,10 +899,10 @@ func TestAccessLogReportsTheStatusOfARecoveredPanic(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, entry.Status)
 }
 
-// TestAccessLogCarriesTheRequestIDTheClientGot ties the two ends of the
-// identifier together. It is returned in a header so that a client can quote
-// it when reporting a problem, which is worth nothing unless the same value is
-// the one the log lines of that request were written under.
+// The two ends of the identifier together. It is returned in a header so that
+// a client can quote it when reporting a problem, which is worth nothing
+// unless the same value is the one the log lines of that request were written
+// under.
 func TestAccessLogCarriesTheRequestIDTheClientGot(t *testing.T) {
 	logger, records := captureLogger()
 
@@ -939,11 +923,10 @@ func TestAccessLogCarriesTheRequestIDTheClientGot(t *testing.T) {
 	require.Equal(t, "/quotes/updates", entry.Path)
 }
 
-// TestAccessLogReportsZeroWhenNothingWasWritten covers the shape an abandoned
-// request takes in the access log. writeInternal declined to answer a
-// connection that is gone and net/http had nobody to send its default 200 to
-// either, so the line carries no status at all -- and the info line with the
-// same request id beside it is what says why.
+// The shape an abandoned request takes in the access log. writeInternal
+// declined to answer a connection that is gone and net/http had nobody to send
+// its default 200 to either, so the line carries no status at all -- and the
+// info line with the same request id beside it is what says why.
 func TestAccessLogReportsZeroWhenNothingWasWritten(t *testing.T) {
 	logger, records := captureLogger()
 
@@ -966,11 +949,10 @@ func TestAccessLogReportsZeroWhenNothingWasWritten(t *testing.T) {
 	require.Equal(t, access.RequestID, abandoned.RequestID, "the two lines of one request cannot be tied together")
 }
 
-// TestHealthzWritesNoLogLine states directly what the missing request id only
-// implies. The compose healthcheck calls the probe every five seconds --
-// seventeen thousand lines a day, in which anything worth reading would be
-// lost -- and keeping it out of the log is the reason it is registered outside
-// the middleware group at all.
+// Directly what the missing request id only implies. The compose healthcheck
+// calls the probe every five seconds -- seventeen thousand lines a day, in
+// which anything worth reading would be lost -- and keeping it out of the log
+// is the reason it is registered outside the middleware group at all.
 func TestHealthzWritesNoLogLine(t *testing.T) {
 	logger, records := captureLogger()
 
@@ -1009,10 +991,10 @@ func (b *brokenWriter) Write([]byte) (int, error) {
 	return 0, b.err
 }
 
-// TestWriteJSONFailureIsLoggedNotAnswered covers what happens when the body
-// cannot be written. The status and the headers are already gone, so there is
-// no way left to tell the client anything: all that remains is to write down
-// what happened, and which log that goes to depends on whose fault it was.
+// What happens when the body cannot be written. The status and the headers are
+// already gone, so there is no way left to tell the client anything: all that
+// remains is to write down what happened, and which log that goes to depends
+// on whose fault it was.
 func TestWriteJSONFailureIsLoggedNotAnswered(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1068,11 +1050,11 @@ func TestWriteJSONFailureIsLoggedNotAnswered(t *testing.T) {
 	}
 }
 
-// TestRecoverPanicPassesOnAnAbortedHandler covers the one panic that must not
-// be turned into an answer. http.ErrAbortHandler is the documented way for a
-// handler to drop a response without a word; net/http raises it and expects to
-// catch it again, so swallowing it here would turn a deliberate abort into a
-// 500 and log a fault that never happened.
+// The one panic that must not be turned into an answer. http.ErrAbortHandler
+// is the documented way for a handler to drop a response without a word;
+// net/http raises it and expects to catch it again, so swallowing it here
+// would turn a deliberate abort into a 500 and log a fault that never
+// happened.
 func TestRecoverPanicPassesOnAnAbortedHandler(t *testing.T) {
 	logger, records := captureLogger()
 
@@ -1094,10 +1076,10 @@ func TestRecoverPanicPassesOnAnAbortedHandler(t *testing.T) {
 	}
 }
 
-// TestRecoverPanicLeavesAnAnsweredRequestAlone covers the guard in front of the
-// envelope. A panic after the status has gone out cannot be reported to the
-// client at all: a second WriteHeader is refused with a complaint of its own,
-// and the envelope would land at the end of a body that is already valid.
+// The guard in front of the envelope. A panic after the status has gone out
+// cannot be reported to the client at all: a second WriteHeader is refused
+// with a complaint of its own, and the envelope would land at the end of a
+// body that is already valid.
 //
 // The chain is built here rather than taken from NewRouter because no handler
 // of this service writes and then panics -- what is under test is the
@@ -1128,8 +1110,6 @@ func TestRecoverPanicLeavesAnAnsweredRequestAlone(t *testing.T) {
 	requireEntry(t, records(), "panic in handler")
 }
 
-// requirePairRefusal checks a 400 that names a pair as the reason and returns
-// the message it carried.
 func requirePairRefusal(t *testing.T, w *httptest.ResponseRecorder) string {
 	t.Helper()
 
@@ -1142,15 +1122,11 @@ func requirePairRefusal(t *testing.T, w *httptest.ResponseRecorder) string {
 	return got.Error.Message
 }
 
-// TestPairRefusalCarriesTheDomainSentence pins what a client is told about a
-// pair this service cannot quote. The sentence naming the currency at fault is
-// written by ParsePair to be read from outside, and it reaches the client
-// unchanged: a wrapper added on the way out would put the name of an internal
-// operation into an answer meant for a person.
-//
-// Compared against what ParsePair itself returns rather than against a literal:
-// the wording is the domain's to change, and what this test is about is that
-// nothing was added to it on the way through.
+// The sentence naming the currency at fault is written by ParsePair to be read
+// from outside and reaches the client unchanged: a wrapper added on the way
+// out would put the name of an internal operation into an answer meant for a
+// person. Compared against what ParsePair returns rather than a literal, since
+// the wording is the domain's to change.
 func TestPairRefusalCarriesTheDomainSentence(t *testing.T) {
 	t.Run("posting an update", func(t *testing.T) {
 		_, want := domain.ParsePair("EUR/RUB")
@@ -1193,10 +1169,10 @@ func TestPairRefusalCarriesTheDomainSentence(t *testing.T) {
 	})
 }
 
-// TestGetLatestQuoteNormalisesTheInstant pins the two halves of what the spec
-// says about fetched_at, neither of which the generated type gives on its own:
-// the driver hands back a timestamptz in the zone of the session, and a
-// time.Time marshals in its own zone and with whatever precision it carries.
+// The two halves of what the spec says about fetched_at, neither of which the
+// generated type gives on its own: the driver hands back a timestamptz in the
+// zone of the session, and a time.Time marshals in its own zone and with
+// whatever precision it carries.
 func TestGetLatestQuoteNormalisesTheInstant(t *testing.T) {
 	mexicoCity := time.FixedZone("CST", -6*60*60)
 

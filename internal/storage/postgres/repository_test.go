@@ -17,27 +17,17 @@ import (
 	"github.com/llukmann/currency-quotes-service/internal/domain"
 )
 
-// testDatabaseURL names the database these tests run against. It is separate
-// from DATABASE_URL on purpose: the tests truncate every table between cases,
-// and a variable shared with the running service would make that a plausible
-// accident.
-//
-// Without it every test here skips, so `go test ./...` stays green on a clean
-// clone with nothing running. With it -- the compose database published on the
-// host will do -- the statements are exercised against a real PostgreSQL, which
-// is the only thing that can answer for them: what SKIP LOCKED does under
-// contention, whether a partial index catches a conflict, how the driver maps
-// numeric to decimal.Decimal.
+// Separate from DATABASE_URL on purpose: these tests truncate every table
+// between cases, and a variable shared with the running service would make
+// that a plausible accident. Unset, every test here skips.
 const testDatabaseURL = "TEST_DATABASE_URL"
 
-// testKeyTTL is the lifetime the repository under test binds keys for. Long
-// enough that nothing expires by the clock during a run: the tests that are
-// about expiry move a row's timestamp instead of waiting for one.
+// Long enough that nothing expires by the clock during a run: the tests about
+// expiry move a row's timestamp instead of waiting for one.
 const testKeyTTL = time.Hour
 
-// pool is shared by every test in the package, since connecting per test would
-// dominate the runtime. The tests do not run in parallel and each starts from
-// an empty schema.
+// Shared, since connecting per test would dominate the runtime. The tests do
+// not run in parallel and each starts from an empty schema.
 var pool *pgxpool.Pool
 
 func TestMain(m *testing.M) {
@@ -51,7 +41,7 @@ func TestMain(m *testing.M) {
 		// SQL. One line, once per package, in the output of a plain run.
 		fmt.Fprintf(os.Stderr,
 			"%s is not set: the storage tests are SKIPPED and no SQL is exercised.\n"+
-				"Point it at a database of its own to run them, see .env.example.\n",
+				"Point it at a database of its own to run them, see the Tests section of README.md.\n",
 			testDatabaseURL)
 
 		os.Exit(m.Run())
@@ -80,7 +70,7 @@ func TestMain(m *testing.M) {
 	if err := requireSchema(ctx, p); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"%s is set but the schema is not there: %v\n"+
-				"Apply the migrations to it first, see .env.example.\n",
+				"Apply the migrations to it first, see the Tests section of README.md.\n",
 			testDatabaseURL, err)
 		os.Exit(1)
 	}
@@ -92,7 +82,6 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// requireSchema reports whether the tables these tests read and write exist.
 func requireSchema(ctx context.Context, p *pgxpool.Pool) error {
 	const query = `SELECT to_regclass('quote_updates'), to_regclass('quotes'), to_regclass('idempotency_keys')`
 
@@ -108,8 +97,6 @@ func requireSchema(ctx context.Context, p *pgxpool.Pool) error {
 	return nil
 }
 
-// newRepo returns a repository over an empty schema, or skips the test when
-// there is no database to run against.
 func newRepo(t *testing.T) *Repository {
 	t.Helper()
 
@@ -125,7 +112,6 @@ func newRepo(t *testing.T) *Repository {
 	return &Repository{pool: pool, keyTTL: testKeyTTL}
 }
 
-// createTask queues a refresh and fails the test if it could not be queued.
 func createTask(t *testing.T, r *Repository, pair string, key *uuid.UUID) domain.UpdateTask {
 	t.Helper()
 
@@ -135,7 +121,6 @@ func createTask(t *testing.T, r *Repository, pair string, key *uuid.UUID) domain
 	return task
 }
 
-// claimTask takes the next task and fails the test if the queue is empty.
 func claimTask(t *testing.T, r *Repository) domain.UpdateTask {
 	t.Helper()
 
@@ -146,8 +131,6 @@ func claimTask(t *testing.T, r *Repository) domain.UpdateTask {
 	return task
 }
 
-// finish drives a task to done, so that a test about idempotency keys can put
-// one out of the way of the partial index on unfinished work.
 func finish(t *testing.T, r *Repository, task domain.UpdateTask) {
 	t.Helper()
 
@@ -161,8 +144,6 @@ func finish(t *testing.T, r *Repository, task domain.UpdateTask) {
 	require.NoError(t, err)
 }
 
-// countRows answers how much of a table survived, which is how the tests about
-// races check that nothing was left behind.
 func countRows(t *testing.T, table string) int {
 	t.Helper()
 
@@ -172,10 +153,8 @@ func countRows(t *testing.T, table string) int {
 	return n
 }
 
-// age moves a row's clock back by d, so that a test about staleness does not
-// have to wait for it. The column is written directly because the age is
-// measured by the database clock everywhere in the repository, and a value
-// computed here would be measured against this machine's.
+// Moves a row's clock back by d, written directly because age is measured by
+// the database clock everywhere in the repository.
 func age(t *testing.T, table, column string, id uuid.UUID, d time.Duration) {
 	t.Helper()
 
@@ -185,8 +164,6 @@ func age(t *testing.T, table, column string, id uuid.UUID, d time.Duration) {
 	require.NoError(t, err)
 }
 
-// idColumn names the identifier of a table, which the two tables the tests
-// backdate spell differently.
 func idColumn(table string) string {
 	if table == "idempotency_keys" {
 		return "key"
@@ -195,9 +172,9 @@ func idColumn(table string) string {
 	return "id"
 }
 
-// TestCreateTask checks what a post leaves in the table. The identifier and
-// both timestamps come from the database, so what comes back has to be the row
-// a client will later be shown.
+// What a post leaves in the table. The identifier and both timestamps come
+// from the database, so what comes back has to be the row a client will later
+// be shown.
 func TestCreateTask(t *testing.T) {
 	repo := newRepo(t)
 
@@ -214,10 +191,9 @@ func TestCreateTask(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "quote_updates"))
 }
 
-// TestCreateTaskDeduplicatesUnfinishedWork covers the half of the mechanism
-// that needs no key: at most one task per pair may be waiting or running, so a
-// second post lands on the first task rather than queueing another refresh of
-// the same thing.
+// The half of the mechanism that needs no key: at most one task per pair may
+// be waiting or running, so a second post lands on the first task rather than
+// queueing another refresh of the same thing.
 func TestCreateTaskDeduplicatesUnfinishedWork(t *testing.T) {
 	repo := newRepo(t)
 
@@ -234,9 +210,9 @@ func TestCreateTaskDeduplicatesUnfinishedWork(t *testing.T) {
 	require.Equal(t, 2, countRows(t, "quote_updates"))
 }
 
-// TestCreateTaskDeduplicatesOntoAClaimedTask checks that the predicate covers
-// in_progress as well as pending. Were it pending alone, a post arriving during
-// the claim would be handed a second update of the same pair.
+// The predicate covers in_progress as well as pending. Were it pending alone,
+// a post arriving during the claim would be handed a second update of the same
+// pair.
 func TestCreateTaskDeduplicatesOntoAClaimedTask(t *testing.T) {
 	repo := newRepo(t)
 
@@ -251,12 +227,11 @@ func TestCreateTaskDeduplicatesOntoAClaimedTask(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "quote_updates"))
 }
 
-// TestCreateTaskDoesNotTouchTheRecoveryClock is the reason the conflicting
-// insert updates a column with its own value. For an in_progress row
-// updated_at is the claim time the recovery pass measures staleness against,
-// and posts on a busy pair would otherwise push the threshold ahead of itself
-// for as long as they kept arriving -- leaving a task abandoned by a dead
-// worker in progress forever.
+// The reason the conflicting insert updates a column with its own value. For
+// an in_progress row updated_at is the claim time the recovery pass measures
+// staleness against, and posts on a busy pair would otherwise push the
+// threshold ahead of itself for as long as they kept arriving -- leaving a
+// task abandoned by a dead worker in progress forever.
 func TestCreateTaskDoesNotTouchTheRecoveryClock(t *testing.T) {
 	repo := newRepo(t)
 
@@ -272,8 +247,8 @@ func TestCreateTaskDoesNotTouchTheRecoveryClock(t *testing.T) {
 	require.Equal(t, before.UpdatedAt, after.UpdatedAt, "the post moved the recovery clock")
 }
 
-// TestCreateTaskAfterATerminalStatus checks that finished history never blocks
-// new work: the unique index covers the unfinished statuses only.
+// Finished history never blocks new work: the unique index covers the
+// unfinished statuses only.
 func TestCreateTaskAfterATerminalStatus(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -310,9 +285,9 @@ func TestCreateTaskAfterATerminalStatus(t *testing.T) {
 	}
 }
 
-// TestCreateTaskWithAKey covers the case the whole mechanism exists for: one
-// client sending the same request twice, usually long after the first task
-// finished, when nothing else would deduplicate it.
+// The case the whole mechanism exists for: one client sending the same request
+// twice, usually long after the first task finished, when nothing else would
+// deduplicate it.
 func TestCreateTaskWithAKey(t *testing.T) {
 	repo := newRepo(t)
 
@@ -326,10 +301,10 @@ func TestCreateTaskWithAKey(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "idempotency_keys"))
 }
 
-// TestCreateTaskReplaysAKeyAfterTheTaskFinished checks the window the key
-// covers and the pair index does not. The answer carries the status the row
-// holds now, which is how a client that retried after a failure learns to send
-// a fresh key rather than poll a task that will never move.
+// The window the key covers and the pair index does not. The answer carries
+// the status the row holds now, which is how a client that retried after a
+// failure learns to send a fresh key rather than poll a task that will never
+// move.
 func TestCreateTaskReplaysAKeyAfterTheTaskFinished(t *testing.T) {
 	repo := newRepo(t)
 
@@ -346,10 +321,10 @@ func TestCreateTaskReplaysAKeyAfterTheTaskFinished(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "quote_updates"))
 }
 
-// TestCreateTaskBindsASecondKeyToOneTask checks that several keys can point at
-// one task, which is why the bindings live in a table of their own: a post that
-// deduplicates onto unfinished work binds its own key to that same row, and a
-// column on the task would hold only the first.
+// Several keys can point at one task, which is why the bindings live in a
+// table of their own: a post that deduplicates onto unfinished work binds its
+// own key to that same row, and a column on the task would hold only the
+// first.
 func TestCreateTaskBindsASecondKeyToOneTask(t *testing.T) {
 	repo := newRepo(t)
 
@@ -363,9 +338,8 @@ func TestCreateTaskBindsASecondKeyToOneTask(t *testing.T) {
 	require.Equal(t, 2, countRows(t, "idempotency_keys"))
 }
 
-// TestCreateTaskKeyConflict checks the refusal a 409 is built on. Answering
-// with the bound task instead would hand the client an update of a pair it
-// never asked for.
+// The refusal a 409 is built on. Answering with the bound task instead would
+// hand the client an update of a pair it never asked for.
 func TestCreateTaskKeyConflict(t *testing.T) {
 	repo := newRepo(t)
 
@@ -382,10 +356,10 @@ func TestCreateTaskKeyConflict(t *testing.T) {
 	require.Equal(t, domain.StatusPending, taskByID(t, first.ID).Status)
 }
 
-// TestCreateTaskConcurrentWithOneKey is the test the transaction exists for.
-// Twenty posts sharing a key are serialised by the primary key of the bindings
-// table -- by a constraint rather than by anything the service checks -- and
-// every one of them has to come back with the same task.
+// The test the transaction exists for. Twenty posts sharing a key are
+// serialised by the primary key of the bindings table -- by a constraint
+// rather than by anything the service checks -- and every one of them has to
+// come back with the same task.
 func TestCreateTaskConcurrentWithOneKey(t *testing.T) {
 	repo := newRepo(t)
 
@@ -420,9 +394,9 @@ func TestCreateTaskConcurrentWithOneKey(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "idempotency_keys"))
 }
 
-// TestCreateTaskConcurrentWithoutAKey checks the other arbiter under the same
-// pressure: with no key at all, the partial unique index on the pair is what
-// keeps twenty simultaneous posts down to one refresh.
+// The other arbiter under the same pressure: with no key at all, the partial
+// unique index on the pair is what keeps twenty simultaneous posts down to one
+// refresh.
 func TestCreateTaskConcurrentWithoutAKey(t *testing.T) {
 	repo := newRepo(t)
 
@@ -454,11 +428,10 @@ func TestCreateTaskConcurrentWithoutAKey(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "quote_updates"))
 }
 
-// TestCreateTaskConcurrentWithOneKeyOverManyPairs checks that a lost race
-// leaves nothing behind. Each post writes its task before it finds out whether
-// its key is free, so the losers have a task in hand when they are refused --
-// and the rollback has to take it with them, or the table fills with updates
-// whose identifier reached nobody.
+// A lost race leaves nothing behind. Each post writes its task before it finds
+// out whether its key is free, so the losers have a task in hand when they are
+// refused -- and the rollback has to take it with them, or the table fills
+// with updates whose identifier reached nobody.
 func TestCreateTaskConcurrentWithOneKeyOverManyPairs(t *testing.T) {
 	repo := newRepo(t)
 
@@ -521,9 +494,9 @@ func TestCreateTaskConcurrentWithOneKeyOverManyPairs(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "idempotency_keys"))
 }
 
-// TestGetTask checks the single query that answers the endpoint a client polls,
-// in the two shapes it has: a task with no quote yet, and a completed one whose
-// rate is joined in.
+// The single query that answers the endpoint a client polls, in the two shapes
+// it has: a task with no quote yet, and a completed one whose rate is joined
+// in.
 func TestGetTask(t *testing.T) {
 	repo := newRepo(t)
 
@@ -553,9 +526,8 @@ func TestGetTask(t *testing.T) {
 	require.Equal(t, fetchedAt, details.Quote.FetchedAt.UTC())
 }
 
-// TestGetTaskNotFound checks that a well formed identifier naming no task is a
-// fact rather than a failure: the API turns this into a 404 and everything else
-// into a 500.
+// A well formed identifier naming no task is a fact rather than a failure: the
+// API turns this into a 404 and everything else into a 500.
 func TestGetTaskNotFound(t *testing.T) {
 	repo := newRepo(t)
 
@@ -564,8 +536,8 @@ func TestGetTaskNotFound(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrNotFound)
 }
 
-// TestGetTaskCarriesTheFailureReason checks that a failed task answers with the
-// reason the worker wrote, which is what a client is shown.
+// A failed task answers with the reason the worker wrote, which is what a
+// client is shown.
 func TestGetTaskCarriesTheFailureReason(t *testing.T) {
 	repo := newRepo(t)
 
@@ -580,9 +552,9 @@ func TestGetTaskCarriesTheFailureReason(t *testing.T) {
 	require.Nil(t, details.Quote)
 }
 
-// TestRateSurvivesTheRoundTrip is the invariant the whole decimal choice rests
-// on. The values below are chosen to be exactly the ones binary floating point
-// cannot hold: a rate that survived a float64 would be a coincidence.
+// The invariant the whole decimal choice rests on. The values below are chosen
+// to be exactly the ones binary floating point cannot hold: a rate that
+// survived a float64 would be a coincidence.
 func TestRateSurvivesTheRoundTrip(t *testing.T) {
 	tests := []struct {
 		name string
@@ -616,9 +588,9 @@ func TestRateSurvivesTheRoundTrip(t *testing.T) {
 	}
 }
 
-// TestGetLatestQuote checks the ordering the endpoint depends on. It is by
-// fetched_at rather than rate_date because a weekend leaves several rows
-// sharing one rate_date, and their order would then be undefined.
+// The ordering the endpoint depends on. It is by fetched_at rather than
+// rate_date because a weekend leaves several rows sharing one rate_date, and
+// their order would then be undefined.
 func TestGetLatestQuote(t *testing.T) {
 	repo := newRepo(t)
 
@@ -654,9 +626,9 @@ func TestGetLatestQuote(t *testing.T) {
 	require.Equal(t, rateDate, quote.RateDate.UTC())
 }
 
-// TestGetLatestQuoteNotFound checks the answer for a supported pair nobody has
-// quoted yet, which the API tells apart from an unsupported one: this pair will
-// have a rate as soon as an update completes.
+// The answer for a supported pair nobody has quoted yet, which the API tells
+// apart from an unsupported one: this pair will have a rate as soon as an
+// update completes.
 func TestGetLatestQuoteNotFound(t *testing.T) {
 	repo := newRepo(t)
 
@@ -668,9 +640,9 @@ func TestGetLatestQuoteNotFound(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrNotFound)
 }
 
-// TestClaimTask checks what a claim does to the row: the status and the attempt
-// counter move together, and the counter is what identifies this claim to the
-// finalisation later.
+// What a claim does to the row: the status and the attempt counter move
+// together, and the counter is what identifies this claim to the finalisation
+// later.
 func TestClaimTask(t *testing.T) {
 	repo := newRepo(t)
 
@@ -685,8 +657,8 @@ func TestClaimTask(t *testing.T) {
 	require.False(t, claim.UpdatedAt.Before(queued.UpdatedAt), "the claim did not move updated_at")
 }
 
-// TestClaimTaskEmptyQueue checks that an idle queue is a state and not an
-// error: it is what a worker sees most of the time.
+// An idle queue is a state and not an error: it is what a worker sees most of
+// the time.
 func TestClaimTaskEmptyQueue(t *testing.T) {
 	repo := newRepo(t)
 
@@ -697,8 +669,8 @@ func TestClaimTaskEmptyQueue(t *testing.T) {
 	require.Empty(t, task)
 }
 
-// TestClaimTaskTakesTheOldestFirst checks the ordering of the queue, so that a
-// steady stream of posts cannot leave an early task waiting indefinitely.
+// The ordering of the queue, so that a steady stream of posts cannot leave an
+// early task waiting indefinitely.
 func TestClaimTaskTakesTheOldestFirst(t *testing.T) {
 	repo := newRepo(t)
 
@@ -715,14 +687,10 @@ func TestClaimTaskTakesTheOldestFirst(t *testing.T) {
 	require.False(t, ok)
 }
 
-// TestClaimTaskHandsEachTaskToOneWorker checks the guarantee a pool of workers
-// rests on: under contention every task goes to exactly one of them, so the
-// provider is never called twice for one update.
-//
-// What it does not check is SKIP LOCKED, which the test below covers instead:
-// this one passes without it too, since a claim that waits for the lock and
-// then finds the row taken moves on to the next. Waiting is the cost SKIP
-// LOCKED removes, not a wrong answer it prevents.
+// Not a test of SKIP LOCKED, which the one below covers: this passes without
+// it too, since a claim that waits for the lock and then finds the row taken
+// moves on. Waiting is the cost SKIP LOCKED removes, not a wrong answer it
+// prevents.
 func TestClaimTaskHandsEachTaskToOneWorker(t *testing.T) {
 	repo := newRepo(t)
 
@@ -774,13 +742,9 @@ func TestClaimTaskHandsEachTaskToOneWorker(t *testing.T) {
 	}
 }
 
-// TestClaimTaskDoesNotWaitForALockedRow is what SKIP LOCKED is for, and the
-// reason a pool of workers is worth having: without it they would queue up
-// behind the same oldest row and run as one.
-//
-// The oldest task is locked by a transaction that is deliberately left open, so
-// the claim has to step over it rather than wait. The deadline is what makes
-// the difference visible: waiting would run into it instead of returning the
+// The oldest task is locked by a transaction deliberately left open, so the
+// claim has to step over it rather than wait. The deadline is what makes the
+// difference visible: waiting would run into it instead of returning the
 // second task.
 func TestClaimTaskDoesNotWaitForALockedRow(t *testing.T) {
 	repo := newRepo(t)
@@ -809,9 +773,9 @@ func TestClaimTaskDoesNotWaitForALockedRow(t *testing.T) {
 	require.Equal(t, second.ID, claim.ID, "the claim did not step over the locked task")
 }
 
-// TestCompleteTask checks the finalisation, which has to be all or nothing: a
-// quote whose task is not finished would be served by GET /quotes/latest under
-// a task that still claims to be running.
+// The finalisation, which has to be all or nothing: a quote whose task is not
+// finished would be served by GET /quotes/latest under a task that still
+// claims to be running.
 func TestCompleteTask(t *testing.T) {
 	repo := newRepo(t)
 
@@ -836,10 +800,10 @@ func TestCompleteTask(t *testing.T) {
 	require.Equal(t, claim.ID, quote.UpdateID)
 }
 
-// TestCompleteTaskStaleClaim checks the proof of ownership a finalisation has
-// to carry. The task belongs to someone else by now, so storing the rate would
-// attach it to an update that is queued or running again -- and the rate is
-// discarded instead, leaving no row in quotes.
+// The proof of ownership a finalisation has to carry. The task belongs to
+// someone else by now, so storing the rate would attach it to an update that
+// is queued or running again -- and the rate is discarded instead, leaving no
+// row in quotes.
 func TestCompleteTaskStaleClaim(t *testing.T) {
 	tests := []struct {
 		name string
@@ -892,7 +856,7 @@ func TestCompleteTaskStaleClaim(t *testing.T) {
 	}
 }
 
-// TestFailTask checks the terminal status a client is shown a reason with.
+// The terminal status a client is shown a reason with.
 func TestFailTask(t *testing.T) {
 	repo := newRepo(t)
 
@@ -907,9 +871,9 @@ func TestFailTask(t *testing.T) {
 	require.Zero(t, countRows(t, "quotes"))
 }
 
-// TestFailTaskEmptyReason checks the guard in front of a constraint the schema
-// states in one direction only: an empty string satisfies "a failed task has a
-// reason" while telling a client nothing.
+// The guard in front of a constraint the schema states in one direction only:
+// an empty string satisfies "a failed task has a reason" while telling a
+// client nothing.
 func TestFailTaskEmptyReason(t *testing.T) {
 	repo := newRepo(t)
 
@@ -920,9 +884,8 @@ func TestFailTaskEmptyReason(t *testing.T) {
 	require.Equal(t, domain.StatusInProgress, taskByID(t, claim.ID).Status)
 }
 
-// TestFailTaskStaleClaim checks that a worker cannot report a failure of a task
-// that is no longer its own, which would overwrite the state of whoever holds
-// it now.
+// A worker cannot report a failure of a task that is no longer its own, which
+// would overwrite the state of whoever holds it now.
 func TestFailTaskStaleClaim(t *testing.T) {
 	repo := newRepo(t)
 
@@ -938,9 +901,9 @@ func TestFailTaskStaleClaim(t *testing.T) {
 	require.Equal(t, domain.StatusInProgress, taskByID(t, current.ID).Status)
 }
 
-// TestReleaseTask checks the way out for a worker that is giving a task up
-// rather than finishing it: on shutdown nobody is at fault, so failing the task
-// would tell a client the provider was.
+// The way out for a worker that is giving a task up rather than finishing it:
+// on shutdown nobody is at fault, so failing the task would tell a client the
+// provider was.
 func TestReleaseTask(t *testing.T) {
 	repo := newRepo(t)
 
@@ -959,8 +922,8 @@ func TestReleaseTask(t *testing.T) {
 	require.Equal(t, 2, claimTask(t, repo).Attempts)
 }
 
-// TestReleaseTaskStaleClaim checks that a worker leaving late cannot take the
-// task away from whoever claimed it after the recovery pass released it.
+// A worker leaving late cannot take the task away from whoever claimed it
+// after the recovery pass released it.
 func TestReleaseTaskStaleClaim(t *testing.T) {
 	repo := newRepo(t)
 
@@ -975,11 +938,11 @@ func TestReleaseTaskStaleClaim(t *testing.T) {
 	require.Equal(t, domain.StatusInProgress, taskByID(t, current.ID).Status)
 }
 
-// TestReleaseStuckTasks covers the pass that deals with tasks left in progress
-// by a worker that died: nothing releases those on their own, since the row
-// lock disappeared along with the process. Both branches matter -- one returns
-// work to the queue, the other stops a task that reliably kills its worker from
-// cycling between claim and release forever.
+// The pass that deals with tasks left in progress by a worker that died:
+// nothing releases those on their own, since the row lock disappeared along
+// with the process. Both branches matter -- one returns work to the queue, the
+// other stops a task that reliably kills its worker from cycling between claim
+// and release forever.
 func TestReleaseStuckTasks(t *testing.T) {
 	const (
 		threshold   = time.Minute
@@ -1064,9 +1027,8 @@ func TestReleaseStuckTasks(t *testing.T) {
 	}
 }
 
-// TestReleaseStuckTasksLeavesTerminalTasksAlone checks that the pass touches
-// nothing that has finished. A done task carries a quote, and reopening it
-// would put a second rate under one update.
+// The pass touches nothing that has finished. A done task carries a quote, and
+// reopening it would put a second rate under one update.
 func TestReleaseStuckTasksLeavesTerminalTasksAlone(t *testing.T) {
 	repo := newRepo(t)
 
@@ -1093,8 +1055,8 @@ func TestReleaseStuckTasksLeavesTerminalTasksAlone(t *testing.T) {
 	require.Equal(t, domain.StatusPending, taskByID(t, queued.ID).Status)
 }
 
-// TestReleaseStuckTasksEmptyReason checks the same guard FailTask carries: the
-// pass writes a failure a client will read.
+// The same guard FailTask carries: the pass writes a failure a client will
+// read.
 func TestReleaseStuckTasksEmptyReason(t *testing.T) {
 	repo := newRepo(t)
 
@@ -1103,9 +1065,9 @@ func TestReleaseStuckTasksEmptyReason(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestExpiredKeyIsTakenOver covers the whole of what ends a binding now that
-// nothing deletes one: the lookup stops seeing the row, and the post that finds
-// it expired writes its own task over it.
+// The whole of what ends a binding now that nothing deletes one: the lookup
+// stops seeing the row, and the post that finds it expired writes its own task
+// over it.
 func TestExpiredKeyIsTakenOver(t *testing.T) {
 	repo := newRepo(t)
 
@@ -1132,9 +1094,8 @@ func TestExpiredKeyIsTakenOver(t *testing.T) {
 	require.Equal(t, second.ID, replayed.ID)
 }
 
-// TestExpiredKeyIsTakenOverAcrossPairs checks the other half of a takeover: an
-// expired binding holds nothing back, so the key is free to name a different
-// pair than the one it was spent on.
+// The other half of a takeover: an expired binding holds nothing back, so the
+// key is free to name a different pair than the one it was spent on.
 func TestExpiredKeyIsTakenOverAcrossPairs(t *testing.T) {
 	repo := newRepo(t)
 
@@ -1155,9 +1116,8 @@ func TestExpiredKeyIsTakenOverAcrossPairs(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "idempotency_keys"))
 }
 
-// TestLiveKeyIsNotTakenOver is the case the condition on the takeover exists
-// for: a binding within its lifetime answers with the task it holds, and no row
-// is written.
+// The case the condition on the takeover exists for: a binding within its
+// lifetime answers with the task it holds, and no row is written.
 func TestLiveKeyIsNotTakenOver(t *testing.T) {
 	repo := newRepo(t)
 
@@ -1173,8 +1133,6 @@ func TestLiveKeyIsNotTakenOver(t *testing.T) {
 	require.Equal(t, 1, countRows(t, "quote_updates"))
 }
 
-// taskByID reads a task straight from the table, so that a test checks what was
-// written rather than what a method chose to return.
 func taskByID(t *testing.T, id uuid.UUID) domain.UpdateTask {
 	t.Helper()
 
@@ -1189,28 +1147,20 @@ func taskByID(t *testing.T, id uuid.UUID) domain.UpdateTask {
 	return task
 }
 
-// today is the rate_date of a quote fetched now: a bare date, which is what the
-// provider publishes and what the column holds.
+// A bare date, which is what the provider publishes and what the column holds.
 func today() time.Time {
 	now := time.Now().UTC()
 
 	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 }
 
-// TestRepositoryReportsAFailingDatabaseAsItself is about what a caller is told
-// when the statement never ran at all.
+// Every method has a second answer that is not an error -- no such row, or the
+// claim is no longer yours -- and both are only meaningful once the database
+// returned something. A statement that never ran must not be reported as
+// either.
 //
-// Every method here has a second answer that is not an error: no such row, or
-// the claim is no longer yours. Both are read from what the database returned,
-// so both are only meaningful once it returned something -- and the layers
-// above act on them. ErrNotFound becomes a 404, telling a client to stop
-// asking about an update that does exist. ErrStaleClaim makes a worker discard
-// a rate it has already fetched, at warning level, as though somebody else had
-// taken the task.
-//
-// A cancelled context is the cheapest way to have every statement fail without
-// touching the database, and it fails them all at the same place: before the
-// query is sent.
+// A cancelled context fails them all at the same place: before the query is
+// sent.
 func TestRepositoryReportsAFailingDatabaseAsItself(t *testing.T) {
 	repo := newRepo(t)
 
@@ -1326,14 +1276,14 @@ func TestRepositoryReportsAFailingDatabaseAsItself(t *testing.T) {
 	require.Equal(t, domain.StatusInProgress, taskByID(t, claim.ID).Status)
 }
 
-// TestCompleteTaskRollsBackARefusedQuote checks the finalising transaction from
-// the side the happy path cannot show. The task is closed first and the quote
-// inserted second, so an insert the column refuses has to take the closure with
-// it -- otherwise the task reads done while no rate exists, and
-// GET /quotes/updates/{id} answers with a completed update carrying nothing.
+// The finalising transaction from the side the happy path cannot show. The
+// task is closed first and the quote inserted second, so an insert the column
+// refuses has to take the closure with it -- otherwise the task reads done
+// while no rate exists, and GET /quotes/updates/{id} answers with a completed
+// update carrying nothing.
 //
-// The rate below is one the provider would never pass on; the constraint is the
-// backstop behind that, and this is the only test that asks it anything.
+// The rate below is one the provider would never pass on; the constraint is
+// the backstop behind that, and this is the only test that asks it anything.
 func TestCompleteTaskRollsBackARefusedQuote(t *testing.T) {
 	repo := newRepo(t)
 
@@ -1349,14 +1299,14 @@ func TestCompleteTaskRollsBackARefusedQuote(t *testing.T) {
 	require.Zero(t, countRows(t, "quotes"))
 }
 
-// TestReplayByKeyWithoutABinding covers the branch that needs the two statements
-// to read the clock at two instants: a binding that still held when the insert
-// refused it, and was expired by the time of the read that follows.
+// The branch that needs the two statements to read the clock at two instants:
+// a binding that still held when the insert refused it, and was expired by the
+// time of the read that follows.
 //
-// Called directly rather than raced into, since what is worth pinning is not how
-// to get there but what happens: it is reported. Answered as a conflict it would
-// tell a client its key belonged to another pair, and answered as success it
-// would hand back an empty task.
+// Called directly rather than raced into, since what is worth pinning is not
+// how to get there but what happens: it is reported. Answered as a conflict it
+// would tell a client its key belonged to another pair, and answered as
+// success it would hand back an empty task.
 func TestReplayByKeyWithoutABinding(t *testing.T) {
 	repo := newRepo(t)
 
