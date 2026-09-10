@@ -53,7 +53,9 @@ curl -s 'localhost:8080/quotes/latest?pair=EUR/MXN'
 ```
 
 A refresh usually completes in under a second: posting the task also wakes a
-worker, rather than leaving it to the next poll of the queue.
+worker, rather than leaving it to the next poll of the queue. Step 3 answers
+`404` until one has finished, since it reads what is stored rather than asking
+for it.
 
 To stop and remove the database volume with it:
 
