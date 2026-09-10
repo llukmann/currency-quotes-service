@@ -65,6 +65,7 @@ docker compose down -v
 
 | Asked for | Where |
 | --- | --- |
+| Three API operations | [API](#api) |
 | Unit tests | [Tests](#tests) — `go test ./...` |
 | Containerisation | `docker-compose.yml`, `Dockerfile` |
 | Idempotent updates | `Idempotency-Key` on `POST`, see [Design decisions](#design-decisions) |
@@ -196,6 +197,12 @@ the same database, `golangci-lint`, a check that the generated contract still
 matches the spec, and a build of the service image.
 
 ## Design decisions
+
+**The handler never performs the update.** It writes a row and returns; the
+package it lives in holds no path to the provider at all, so the asynchronous
+contract is a property of the wiring rather than a promise in prose. The two
+read endpoints are the same: they answer from the database, and a rate a client
+is shown has been through it.
 
 **A post can be answered with a task it did not create.** At most one unfinished
 task exists per pair, so two clients asking for `EUR/MXN` at the same moment
