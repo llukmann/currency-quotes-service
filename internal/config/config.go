@@ -181,7 +181,7 @@ func (c Config) check() error {
 	return nil
 }
 
-// Has to stay strictly under HTTP_WRITE_TIMEOUT, which check is what guarantees.
+// Has to stay strictly under HTTP_WRITE_TIMEOUT. check guarantees that it does.
 func (c Config) HandlerTimeout() time.Duration {
 	return c.HTTPWriteTimeout - handlerTimeoutMargin
 }

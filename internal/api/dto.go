@@ -57,8 +57,6 @@ func newQuoteResponse(q domain.Quote) contract.QuoteResponse {
 	}
 }
 
-// A JSON number would be parsed into a float64 by most clients, and a rate that
-// survives that round trip is a coincidence.
 func formatRate(d decimal.Decimal) string {
 	return d.StringFixed(rateScale)
 }
